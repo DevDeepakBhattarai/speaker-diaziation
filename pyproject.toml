@@ -1,0 +1,19 @@
+[project]
+name = "speaker-diaziation"
+version = "0.1.0"
+description = "Switch between speaker camera videos using audio speaker diarization."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "gradio>=5.0",
+    "huggingface-hub>=0.24,<1",
+    "numpy<2",
+    "pyannote.audio>=3.1,<4",
+    "python-dotenv>=1.0",
+    "speechbrain<1",
+    "torch==2.2.2+cu121",
+    "torchaudio==2.2.2+cu121",
+]
+
+[project.scripts]
+speaker-diarize-switch = "main:main"
