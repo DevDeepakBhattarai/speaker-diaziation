@@ -12,6 +12,8 @@ from pathlib import Path
 
 
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
+MODE_SEPARATE_VIDEOS = "separate-videos"
+MODE_SPLIT_VIDEO = "split-video"
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,13 @@ def source_video_size(path: Path) -> tuple[int, int]:
         if stream.get("codec_type") == "video":
             return int(stream["width"]), int(stream["height"])
     raise SystemExit(f"No video stream found in {path}")
+
+
+def media_has_audio(path: Path) -> bool:
+    return any(
+        stream.get("codec_type") == "audio"
+        for stream in ffprobe_json(path).get("streams", [])
+    )
 
 
 def available_ffmpeg_encoders() -> str:
@@ -171,20 +180,37 @@ def diarize_audio(
 
 
 def merge_segments(segments: list[Segment], *, gap: float, min_duration: float) -> list[Segment]:
-    merged: list[Segment] = []
+    """Merge nearby detections per speaker before discarding short turns.
+
+    Pyannote can split one real utterance into several tiny adjacent detections,
+    including detections interleaved with another speaker's overlapping track.
+    Merging each label independently keeps those real turns intact.
+    """
+    by_speaker: dict[str, list[Segment]] = {}
     for segment in segments:
-        if segment.end - segment.start < min_duration:
-            continue
-        if (
-            merged
-            and merged[-1].speaker == segment.speaker
-            and segment.start - merged[-1].end <= gap
-        ):
-            previous = merged[-1]
-            merged[-1] = Segment(previous.start, max(previous.end, segment.end), previous.speaker)
-        else:
-            merged.append(segment)
-    return merged
+        if segment.end > segment.start:
+            by_speaker.setdefault(segment.speaker, []).append(segment)
+
+    merged: list[Segment] = []
+    for speaker, speaker_segments in by_speaker.items():
+        speaker_merged: list[Segment] = []
+        for segment in sorted(speaker_segments, key=lambda item: (item.start, item.end)):
+            if speaker_merged and segment.start - speaker_merged[-1].end <= gap:
+                previous = speaker_merged[-1]
+                speaker_merged[-1] = Segment(
+                    previous.start,
+                    max(previous.end, segment.end),
+                    speaker,
+                )
+            else:
+                speaker_merged.append(segment)
+        merged.extend(
+            segment
+            for segment in speaker_merged
+            if segment.end - segment.start >= min_duration
+        )
+
+    return sorted(merged, key=lambda item: (item.start, item.end, item.speaker))
 
 
 def fill_timeline(
@@ -194,36 +220,117 @@ def fill_timeline(
     fallback_speaker: str,
     gap_padding: float,
 ) -> list[Segment]:
-    timeline: list[Segment] = []
-    cursor = 0.0
-    current_speaker = segments[0].speaker if segments else fallback_speaker
+    """Create a complete, non-overlapping active-speaker timeline.
 
+    Pyannote may return nested/overlapping tracks. The previous cursor-based
+    implementation consumed a long outer segment first and silently discarded
+    every later-starting speaker inside it. At each boundary, the most recently
+    started active turn now wins, which lets an interruption temporarily take
+    the camera before the underlying speaker resumes.
+    """
+    normalized: list[Segment] = []
     for segment in segments:
         start = max(0.0, min(duration, segment.start - gap_padding))
         end = max(start, min(duration, segment.end + gap_padding))
-        if start > cursor:
-            timeline.append(Segment(cursor, start, current_speaker))
-        if end > cursor:
-            timeline.append(Segment(max(cursor, start), end, segment.speaker))
-            cursor = end
-            current_speaker = segment.speaker
+        if end - start > 0.01:
+            normalized.append(Segment(start, end, segment.speaker))
 
-    if cursor < duration:
-        timeline.append(Segment(cursor, duration, current_speaker))
+    boundaries = {0.0, duration}
+    for segment in normalized:
+        boundaries.add(segment.start)
+        boundaries.add(segment.end)
+    ordered_boundaries = sorted(boundaries)
 
+    timeline: list[Segment] = []
+    current_speaker = fallback_speaker
+    for start, end in zip(ordered_boundaries, ordered_boundaries[1:]):
+        if end - start <= 0.01:
+            continue
+
+        active = [
+            segment
+            for segment in normalized
+            if segment.start <= start + 1e-9 and segment.end > start + 1e-9
+        ]
+        if active:
+            selected = max(
+                active,
+                key=lambda segment: (segment.start, segment.end, segment.speaker),
+            )
+            current_speaker = selected.speaker
+
+        if timeline and timeline[-1].speaker == current_speaker:
+            previous = timeline[-1]
+            timeline[-1] = Segment(previous.start, end, previous.speaker)
+        else:
+            timeline.append(Segment(start, end, current_speaker))
+
+    return timeline
+
+
+def stabilize_timeline(
+    timeline: list[Segment],
+    *,
+    min_switch_duration: float,
+) -> list[Segment]:
+    """Debounce camera changes while preserving substantial speaker turns.
+
+    A camera only changes when the other speaker remains active for at least
+    ``min_switch_duration`` seconds. Short interior detections are absorbed into
+    the surrounding camera hold, preventing one-frame or sub-second flicker.
+    """
     compacted: list[Segment] = []
-    for item in timeline:
-        if item.end - item.start <= 0.01:
+    for item in sorted(timeline, key=lambda segment: (segment.start, segment.end)):
+        if item.end <= item.start:
             continue
         if compacted and compacted[-1].speaker == item.speaker:
             previous = compacted[-1]
-            compacted[-1] = Segment(previous.start, item.end, previous.speaker)
+            compacted[-1] = Segment(previous.start, max(previous.end, item.end), previous.speaker)
         else:
             compacted.append(item)
+
+    if min_switch_duration <= 0 or len(compacted) < 2:
+        return compacted
+
+    changed = True
+    while changed and len(compacted) > 1:
+        changed = False
+        stabilized: list[Segment] = []
+        for index, item in enumerate(compacted):
+            duration = item.end - item.start
+            if duration >= min_switch_duration:
+                stabilized.append(item)
+                continue
+
+            changed = True
+            if stabilized:
+                previous = stabilized[-1]
+                stabilized[-1] = Segment(previous.start, item.end, previous.speaker)
+            elif index + 1 < len(compacted):
+                next_item = compacted[index + 1]
+                compacted[index + 1] = Segment(item.start, next_item.end, next_item.speaker)
+            else:
+                stabilized.append(item)
+
+        compacted = []
+        for item in stabilized:
+            if compacted and compacted[-1].speaker == item.speaker:
+                previous = compacted[-1]
+                compacted[-1] = Segment(previous.start, item.end, previous.speaker)
+            else:
+                compacted.append(item)
+
     return compacted
 
 
-def speaker_indexes_by_detection_order(segments: list[Segment]) -> dict[str, int]:
+def speaker_indexes_by_detection_order(
+    segments: list[Segment],
+    *,
+    first_camera_index: int = 0,
+) -> dict[str, int]:
+    if first_camera_index not in {0, 1}:
+        raise ValueError("first_camera_index must be 0 or 1")
+
     labels: list[str] = []
     for segment in sorted(segments, key=lambda item: (item.start, item.end)):
         if segment.speaker not in labels:
@@ -235,7 +342,22 @@ def speaker_indexes_by_detection_order(segments: list[Segment]) -> dict[str, int
             f"{', '.join(labels) or 'none'}"
         )
 
-    return {labels[0]: 0, labels[1]: 1}
+    second_camera_index = 1 - first_camera_index
+    return {labels[0]: first_camera_index, labels[1]: second_camera_index}
+
+
+def speaker1_active_expression(
+    timeline: list[Segment],
+    mapping: dict[str, int],
+) -> str:
+    speaker1_intervals = [
+        segment for segment in timeline if mapping[segment.speaker] == 1
+    ]
+    conditions = [
+        f"between(t\\,{segment.start:.3f}\\,{segment.end:.3f})"
+        for segment in speaker1_intervals
+    ]
+    return "+".join(conditions) if conditions else "0"
 
 
 def ffmpeg_filter_for_segments(
@@ -247,14 +369,7 @@ def ffmpeg_filter_for_segments(
     use_cuda_overlay: bool,
 ) -> tuple[str, str]:
     output_label = "outv"
-    speaker1_intervals = [
-        segment for segment in timeline if mapping[segment.speaker] == 1
-    ]
-    conditions = [
-        f"between(t\\,{segment.start:.3f}\\,{segment.end:.3f})"
-        for segment in speaker1_intervals
-    ]
-    active_expression = "+".join(conditions) if conditions else "0"
+    active_expression = speaker1_active_expression(timeline, mapping)
 
     if use_cuda_overlay:
         filter_text = (
@@ -278,6 +393,38 @@ def ffmpeg_filter_for_segments(
     return filter_text, output_label
 
 
+def ffmpeg_filter_for_split_video_segments(
+    timeline: list[Segment],
+    mapping: dict[str, int],
+    *,
+    source_width: int,
+    source_height: int,
+) -> tuple[str, str, int, int]:
+    output_label = "outv"
+    output_width = source_width // 2
+    output_height = source_height
+
+    # H.264 encoders commonly require even output dimensions. Dropping one edge
+    # pixel is preferable to stretching either person's half of the source frame.
+    output_width -= output_width % 2
+    output_height -= output_height % 2
+    if output_width < 2 or output_height < 2:
+        raise SystemExit(
+            f"Combined video is too small to split: {source_width}x{source_height}"
+        )
+
+    right_x = source_width - output_width
+    active_expression = speaker1_active_expression(timeline, mapping)
+    filter_text = (
+        "[0:v]setpts=PTS-STARTPTS,split=2[left_source][right_source];\n"
+        f"[left_source]crop={output_width}:{output_height}:0:0,setsar=1[left];\n"
+        f"[right_source]crop={output_width}:{output_height}:{right_x}:0,setsar=1[right];\n"
+        f"[left][right]overlay=enable='gt({active_expression}\\,0)':"
+        f"x=0:y=0:eof_action=repeat:repeatlast=1[{output_label}]"
+    )
+    return filter_text, output_label, output_width, output_height
+
+
 def choose_hwaccel(requested: str, encoder: str) -> str | None:
     if requested == "none":
         return None
@@ -290,6 +437,25 @@ def choose_hwaccel(requested: str, encoder: str) -> str | None:
     if encoder.endswith("_amf"):
         return "dxva2"
     return None
+
+
+def append_video_encoding_options(
+    command: list[str],
+    *,
+    encoder: str,
+    preset: str,
+    crf: int,
+) -> None:
+    if encoder in {"h264_nvenc", "hevc_nvenc"}:
+        command.extend(["-preset", preset, "-cq", str(crf)])
+    elif encoder == "libx264":
+        x264_preset = (
+            preset
+            if preset
+            in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"}
+            else "veryfast"
+        )
+        command.extend(["-preset", x264_preset, "-crf", str(crf)])
 
 
 def assemble_video(
@@ -321,13 +487,20 @@ def assemble_video(
         file.write(filter_text)
 
     command = ["ffmpeg", "-y", "-hide_banner"]
+    audio_input_index: int | None = None
+    resolved_audio = audio_file.resolve()
     for index, video in enumerate(camera_videos):
         if loop_cameras:
             command.extend(["-stream_loop", "-1"])
         if hwaccel:
             command.extend(["-hwaccel", hwaccel, "-hwaccel_output_format", hwaccel])
         command.extend(["-i", str(video)])
-    command.extend(["-i", str(audio_file)])
+        if video.resolve() == resolved_audio:
+            audio_input_index = index
+
+    if audio_input_index is None:
+        audio_input_index = len(camera_videos)
+        command.extend(["-i", str(audio_file)])
 
     command.extend(
         [
@@ -336,25 +509,89 @@ def assemble_video(
             "-map",
             f"[{output_label}]",
             "-map",
-            f"{len(camera_videos)}:a:0",
+            f"{audio_input_index}:a:0",
             "-c:v",
             encoder,
             "-aspect",
             f"{width}:{height}",
         ]
     )
+    append_video_encoding_options(command, encoder=encoder, preset=preset, crf=crf)
 
-    if encoder in {"h264_nvenc", "hevc_nvenc"}:
-        command.extend(["-preset", preset, "-cq", str(crf)])
-    elif encoder == "libx264":
-        x264_preset = (
-            preset
-            if preset
-            in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"}
-            else "veryfast"
+    command.extend(
+        [
+            "-c:a",
+            audio_codec,
+            "-max_muxing_queue_size",
+            "4096",
+            "-t",
+            f"{(render_duration or media_duration(audio_file)):.3f}",
+            str(output_video),
+        ]
+    )
+
+    try:
+        run(command)
+    finally:
+        filter_path.unlink(missing_ok=True)
+
+
+def assemble_split_video(
+    *,
+    audio_file: Path,
+    combined_video: Path,
+    output_video: Path,
+    timeline: list[Segment],
+    mapping: dict[str, int],
+    encoder: str,
+    audio_codec: str,
+    preset: str,
+    crf: int,
+    hwaccel: str | None,
+    loop_video: bool,
+    render_duration: float | None,
+) -> None:
+    source_width, source_height = source_video_size(combined_video)
+    filter_text, output_label, output_width, output_height = (
+        ffmpeg_filter_for_split_video_segments(
+            timeline,
+            mapping,
+            source_width=source_width,
+            source_height=source_height,
         )
-        command.extend(["-preset", x264_preset, "-crf", str(crf)])
+    )
 
+    with tempfile.NamedTemporaryFile("w", suffix=".ffmpeg", delete=False, encoding="utf-8") as file:
+        filter_path = Path(file.name)
+        file.write(filter_text)
+
+    command = ["ffmpeg", "-y", "-hide_banner"]
+    if loop_video:
+        command.extend(["-stream_loop", "-1"])
+    if hwaccel:
+        # Keep decoded frames in system memory because crop/overlay are software
+        # filters. Encoding can still use NVENC/AMF/QSV.
+        command.extend(["-hwaccel", hwaccel])
+    command.extend(["-i", str(combined_video)])
+    audio_input_index = 0
+    if combined_video.resolve() != audio_file.resolve():
+        audio_input_index = 1
+        command.extend(["-i", str(audio_file)])
+    command.extend(
+        [
+            "-filter_complex_script",
+            str(filter_path),
+            "-map",
+            f"[{output_label}]",
+            "-map",
+            f"{audio_input_index}:a:0",
+            "-c:v",
+            encoder,
+            "-aspect",
+            f"{output_width}:{output_height}",
+        ]
+    )
+    append_video_encoding_options(command, encoder=encoder, preset=preset, crf=crf)
     command.extend(
         [
             "-c:a",
@@ -397,13 +634,38 @@ def read_segments_json(path: Path) -> tuple[list[Segment], dict[str, int]]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Diarize an audio file, then create a switched video from speaker 0 and "
-            "speaker 1 camera videos."
+            "Diarize an audio file, then switch between either two camera videos or "
+            "the left/right halves of one combined video."
         )
     )
     parser.add_argument("audio_file", type=Path, help="Audio file used for diarization and output.")
-    parser.add_argument("speaker0_video", type=Path, help="Video to show for the first detected speaker.")
-    parser.add_argument("speaker1_video", type=Path, help="Video to show for the second detected speaker.")
+    parser.add_argument(
+        "speaker0_video",
+        type=Path,
+        nargs="?",
+        help=(
+            "First detected speaker video in separate mode, or the combined left/right "
+            "video in split-video mode."
+        ),
+    )
+    parser.add_argument(
+        "speaker1_video",
+        type=Path,
+        nargs="?",
+        help="Second detected speaker video. Required only in separate-videos mode.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=(MODE_SEPARATE_VIDEOS, MODE_SPLIT_VIDEO),
+        default=MODE_SEPARATE_VIDEOS,
+        help="Use two camera files or split one combined left/right video.",
+    )
+    parser.add_argument(
+        "--first-speaker-side",
+        choices=("left", "right"),
+        default="left",
+        help="In split-video mode, side occupied by the first detected speaker.",
+    )
     parser.add_argument("-o", "--output", type=Path, default=Path("speaker_switched.mp4"))
     parser.add_argument("--model", default=DIARIZATION_MODEL, help="Hugging Face diarization model.")
     parser.add_argument("--hf-token", help="Hugging Face token. Defaults to HF_TOKEN.")
@@ -414,6 +676,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--merge-gap", type=float, default=0.30)
     parser.add_argument("--min-segment", type=float, default=0.25)
     parser.add_argument("--gap-padding", type=float, default=0.05)
+    parser.add_argument(
+        "--min-switch-duration",
+        type=float,
+        default=1.0,
+        help="Minimum continuous speaker turn required before changing cameras.",
+    )
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--video-encoder", default="h264_nvenc")
     parser.add_argument("--audio-codec", default="aac")
@@ -427,7 +695,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--loop-speaker-videos",
         action="store_true",
-        help="Loop speaker videos when the audio is longer than the videos.",
+        help="Loop the camera video(s) when the audio is longer.",
     )
     parser.add_argument("--segments-json", type=Path, default=Path("speaker_segments.json"))
     parser.add_argument(
@@ -450,25 +718,48 @@ def main() -> None:
     require_tool("ffmpeg")
     require_tool("ffprobe")
 
-    audio_file = args.audio_file.resolve()
-    speaker0_video = args.speaker0_video.resolve()
-    speaker1_video = args.speaker1_video.resolve()
-    output_video = args.output.resolve()
-    camera_videos = [speaker0_video, speaker1_video]
+    if args.speaker0_video is None:
+        parser.error("A video file is required.")
+    if args.mode == MODE_SEPARATE_VIDEOS and args.speaker1_video is None:
+        parser.error("separate-videos mode requires both speaker video files.")
+    if args.mode == MODE_SPLIT_VIDEO and args.speaker1_video is not None:
+        parser.error("split-video mode accepts exactly one combined video file.")
 
-    for path in [audio_file, *camera_videos]:
+    audio_file = args.audio_file.resolve()
+    first_video = args.speaker0_video.resolve()
+    second_video = args.speaker1_video.resolve() if args.speaker1_video else None
+    output_video = args.output.resolve()
+
+    input_paths = [audio_file, first_video]
+    if second_video is not None:
+        input_paths.append(second_video)
+    for path in input_paths:
         if not path.exists():
             raise SystemExit(f"Input file does not exist: {path}")
 
     encoder = choose_video_encoder(args.video_encoder)
     hwaccel = choose_hwaccel(args.hwaccel, encoder)
+    print(f"Using mode: {args.mode}")
     print(f"Using video encoder: {encoder}")
     print(f"Using FFmpeg hwaccel: {hwaccel or 'none'}")
 
     duration = media_duration(audio_file)
     segments_json = args.segments_json.resolve()
+    first_camera_index = 0
+    if args.mode == MODE_SPLIT_VIDEO and args.first_speaker_side == "right":
+        first_camera_index = 1
+
     if args.reuse_segments:
         timeline, mapping = read_segments_json(segments_json)
+        if args.mode == MODE_SPLIT_VIDEO:
+            mapping = speaker_indexes_by_detection_order(
+                timeline,
+                first_camera_index=first_camera_index,
+            )
+        timeline = stabilize_timeline(
+            timeline,
+            min_switch_duration=args.min_switch_duration,
+        )
         print(f"Reused diarization timeline: {segments_json}")
     else:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -487,12 +778,15 @@ def main() -> None:
         if not raw_segments:
             raise SystemExit("Diarization produced no speaker segments.")
 
+        mapping = speaker_indexes_by_detection_order(
+            raw_segments,
+            first_camera_index=first_camera_index,
+        )
         merged = merge_segments(
             raw_segments,
             gap=args.merge_gap,
             min_duration=args.min_segment,
         )
-        mapping = speaker_indexes_by_detection_order(merged)
         fallback_speaker = next(iter(mapping))
         timeline = fill_timeline(
             merged,
@@ -500,26 +794,47 @@ def main() -> None:
             fallback_speaker=fallback_speaker,
             gap_padding=args.gap_padding,
         )
+        timeline = stabilize_timeline(
+            timeline,
+            min_switch_duration=args.min_switch_duration,
+        )
 
         segments_json.parent.mkdir(parents=True, exist_ok=True)
         write_segments_json(segments_json, timeline, mapping)
         print(f"Wrote diarization timeline: {segments_json}")
 
     output_video.parent.mkdir(parents=True, exist_ok=True)
-    assemble_video(
-        audio_file=audio_file,
-        camera_videos=camera_videos,
-        output_video=output_video,
-        timeline=timeline,
-        mapping=mapping,
-        encoder=encoder,
-        audio_codec=args.audio_codec,
-        preset=args.preset,
-        crf=args.crf,
-        hwaccel=hwaccel,
-        loop_cameras=args.loop_speaker_videos,
-        render_duration=args.render_duration,
-    )
+    if args.mode == MODE_SPLIT_VIDEO:
+        assemble_split_video(
+            audio_file=audio_file,
+            combined_video=first_video,
+            output_video=output_video,
+            timeline=timeline,
+            mapping=mapping,
+            encoder=encoder,
+            audio_codec=args.audio_codec,
+            preset=args.preset,
+            crf=args.crf,
+            hwaccel=hwaccel,
+            loop_video=args.loop_speaker_videos,
+            render_duration=args.render_duration,
+        )
+    else:
+        assert second_video is not None
+        assemble_video(
+            audio_file=audio_file,
+            camera_videos=[first_video, second_video],
+            output_video=output_video,
+            timeline=timeline,
+            mapping=mapping,
+            encoder=encoder,
+            audio_codec=args.audio_codec,
+            preset=args.preset,
+            crf=args.crf,
+            hwaccel=hwaccel,
+            loop_cameras=args.loop_speaker_videos,
+            render_duration=args.render_duration,
+        )
     print(f"Wrote switched video: {output_video}")
 
 

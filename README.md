@@ -1,16 +1,67 @@
 # Speaker Diarization Video Switcher
 
-Creates a final video from exactly three input files:
+Creates a speaker-focused final video from either embedded video audio or a separate soundtrack and:
 
-- one audio file used for diarization and final output audio
-- one video for the first detected speaker
-- one video for the second detected speaker
+- two independent speaker camera videos, or
+- one combined video containing the left and right speakers.
 
-The script converts the audio to mono 16 kHz WAV for pyannote, runs speaker
-diarization, writes speaker timestamps, then uses FFmpeg to switch between the
-two speaker videos. The first unique speaker detected in the audio maps to the
-first speaker video. The second unique speaker detected maps to the second
-speaker video.
+The script converts the selected audio to mono 16 kHz WAV for pyannote, runs
+speaker diarization, writes a stable speaker timeline, and uses FFmpeg to show
+the active speaker. Overlapping pyannote tracks are resolved correctly, and
+short detections are ignored so the camera does not flicker.
+
+Set the Hugging Face token before running either mode:
+
+```powershell
+$env:HF_TOKEN = "hf_..."
+```
+
+## Input Modes
+
+### Two separate speaker videos
+
+This is the original mode. The first unique speaker detected in the soundtrack
+maps to the first speaker video, and the second unique speaker maps to the
+second speaker video.
+
+```powershell
+python main.py .\conversation.wav .\speaker_0.mp4 .\speaker_1.mp4 -o .\out.mp4
+```
+
+### One combined left/right video
+
+This mode accepts one video containing both people. Its embedded audio can be
+used directly, or a separate soundtrack can be selected in the Gradio app. The
+video is divided vertically into two equal views:
+
+- left edge to center = left speaker camera
+- center to right edge = right speaker camera
+
+Only the active speaker's half is rendered. The output keeps the cropped half's
+native aspect ratio and dimensions instead of horizontally stretching it.
+Choose whether the first unique speaker detected in the soundtrack is the
+person on the left or the person on the right.
+
+First detected speaker is on the left:
+
+```powershell
+python main.py .\conversation.wav .\both_speakers.mp4 `
+  --mode split-video `
+  --first-speaker-side left `
+  -o .\out.mp4
+```
+
+First detected speaker is on the right:
+
+```powershell
+python main.py .\conversation.wav .\both_speakers.mp4 `
+  --mode split-video `
+  --first-speaker-side right `
+  -o .\out.mp4
+```
+
+The original command remains unchanged because `separate-videos` is still the
+default mode.
 
 ## Requirements
 
@@ -28,13 +79,6 @@ pip install -e .
 For NVIDIA GPU diarization, install PyTorch from the CUDA wheel index that
 matches your machine before installing the project dependencies.
 
-## Usage
-
-```powershell
-$env:HF_TOKEN = "hf_..."
-python main.py .\conversation.wav .\speaker_0.mp4 .\speaker_1.mp4 -o .\out.mp4
-```
-
 ## Gradio App
 
 Start the local web app:
@@ -43,29 +87,38 @@ Start the local web app:
 .venv\Scripts\python.exe app.py
 ```
 
-Then open the local URL printed by Gradio. Upload the audio file, speaker 0
-video, and speaker 1 video. If you already have `speaker_segments.json`, enable
-timeline reuse to skip diarization and only rerender the video.
+Then open the local URL printed by Gradio:
 
-The output video uses:
+1. Select **Two separate speaker videos** or **One combined left/right video**.
+2. Choose **Use audio from the video** or **Upload a separate audio file**.
+3. In combined-video mode, choose whether the first detected speaker is on the
+   left or right.
+4. Adjust **Minimum speaker turn before switching** when you want a longer or
+   shorter camera hold. The default is 1.0 seconds.
 
-- `conversation.wav` as the audio track
-- `speaker_0.mp4` whenever the first detected speaker is talking
-- `speaker_1.mp4` whenever the second detected speaker is talking
+For two separate videos, embedded-audio mode uses the audio track from the first
+speaker video. For a combined video, it uses that video's own audio track.
+
+If you already have `speaker_segments.json`, enable timeline reuse to skip
+diarization and only rerender the video. In split-video mode, the selected
+left/right first-speaker option is applied even when reusing a timeline.
 
 The script writes `speaker_segments.json`, which contains the detected speaker
-labels, camera mapping, and timestamp timeline used for the FFmpeg render.
+labels, camera mapping, and stabilized timestamp timeline used for the FFmpeg
+render. Nested speaker turns inside a longer overlapping turn are retained, but
+turns shorter than the configured camera-switch duration are absorbed into the
+current shot.
 
-Speaker videos do not loop by default. Pass `--loop-speaker-videos` only when
-one of the camera files is shorter than the audio.
+Camera videos do not loop by default. Pass `--loop-speaker-videos` only when a
+camera file is shorter than the soundtrack.
 
 ## GPU Acceleration
 
 By default, the script uses the NVIDIA CUDA path:
 
 - pyannote diarization runs with `--device cuda`
-- FFmpeg decodes with `--hwaccel cuda`
-- FFmpeg encodes with `--video-encoder h264_nvenc`
+- FFmpeg decoding uses CUDA when requested
+- FFmpeg encoding uses `h264_nvenc`
 
 Useful speed options:
 
