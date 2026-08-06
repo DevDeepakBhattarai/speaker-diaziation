@@ -7,8 +7,9 @@ Creates a speaker-focused final video from either embedded video audio or a sepa
 
 The script converts the selected audio to mono 16 kHz WAV for pyannote, runs
 speaker diarization, writes a stable speaker timeline, and uses FFmpeg to show
-the active speaker. Overlapping pyannote tracks are resolved correctly, and
-short detections are ignored so the camera does not flicker.
+the active speaker. Silence keeps the last visible speaker on screen. Camera
+changes happen only at a confirmed speech onset, so segment endings and quiet
+gaps cannot trigger a cut or make a short detection look artificially long.
 
 Set the Hugging Face token before running either mode:
 
@@ -93,8 +94,11 @@ Then open the local URL printed by Gradio:
 2. Choose **Use audio from the video** or **Upload a separate audio file**.
 3. In combined-video mode, choose whether the first detected speaker is on the
    left or right.
-4. Adjust **Minimum speaker turn before switching** when you want a longer or
-   shorter camera hold. The default is 1.0 seconds.
+4. Adjust **Minimum actual speech before switching** when you want stronger or
+   weaker turn confirmation. The default is 1.0 second.
+5. Long silences default to 2.5 seconds. The app examines up to 5 seconds after
+   that silence to confirm fragmented speech, but the cut is placed at the
+   confirmed speaker's first speech onset, never inside the silence.
 
 For two separate videos, embedded-audio mode uses the audio track from the first
 speaker video. For a combined video, it uses that video's own audio track.
@@ -103,11 +107,11 @@ If you already have `speaker_segments.json`, enable timeline reuse to skip
 diarization and only rerender the video. In split-video mode, the selected
 left/right first-speaker option is applied even when reusing a timeline.
 
-The script writes `speaker_segments.json`, which contains the detected speaker
-labels, camera mapping, and stabilized timestamp timeline used for the FFmpeg
-render. Nested speaker turns inside a longer overlapping turn are retained, but
-turns shorter than the configured camera-switch duration are absorbed into the
-current shot.
+The script writes `speaker_segments.json`, which contains the detected speech
+segments, camera mapping, and final camera timeline used for the FFmpeg render.
+New timeline files preserve the speech evidence so silence-aware settings can be
+reapplied when rerendering. Legacy timeline files can still be reused, but rerun
+diarization once to gain the new silence-aware behavior.
 
 Camera videos do not loop by default. Pass `--loop-speaker-videos` only when a
 camera file is shorter than the soundtrack.

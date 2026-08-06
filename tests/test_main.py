@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import main
 
@@ -44,7 +47,7 @@ class TimelineStabilityTests(unittest.TestCase):
             ],
         )
 
-    def test_nested_speaker_turn_is_not_discarded(self) -> None:
+    def test_segment_ending_does_not_switch_without_new_speech(self) -> None:
         segments = [
             main.Segment(0.0, 10.0, "SPEAKER_00"),
             main.Segment(4.0, 6.0, "SPEAKER_01"),
@@ -59,9 +62,112 @@ class TimelineStabilityTests(unittest.TestCase):
             ),
             [
                 main.Segment(0.0, 4.0, "SPEAKER_00"),
-                main.Segment(4.0, 6.0, "SPEAKER_01"),
-                main.Segment(6.0, 10.0, "SPEAKER_00"),
+                main.Segment(4.0, 10.0, "SPEAKER_01"),
             ],
+        )
+
+    def test_long_silence_keeps_same_speaker_visible(self) -> None:
+        segments = [
+            main.Segment(0.0, 2.0, "SPEAKER_00"),
+            main.Segment(5.0, 7.0, "SPEAKER_00"),
+        ]
+
+        self.assertEqual(
+            main.build_camera_timeline(
+                segments,
+                duration=9.0,
+                fallback_speaker="SPEAKER_00",
+                gap_padding=0.0,
+                min_switch_duration=1.0,
+                silence_threshold=2.5,
+                silence_lookahead=5.0,
+            ),
+            [main.Segment(0.0, 9.0, "SPEAKER_00")],
+        )
+
+    def test_other_speaker_switches_only_when_speech_starts_after_silence(self) -> None:
+        segments = [
+            main.Segment(0.0, 2.0, "SPEAKER_00"),
+            main.Segment(5.0, 7.0, "SPEAKER_01"),
+        ]
+
+        self.assertEqual(
+            main.build_camera_timeline(
+                segments,
+                duration=9.0,
+                fallback_speaker="SPEAKER_00",
+                gap_padding=0.05,
+                min_switch_duration=1.0,
+                silence_threshold=2.5,
+                silence_lookahead=5.0,
+            ),
+            [
+                main.Segment(0.0, 5.0, "SPEAKER_00"),
+                main.Segment(5.0, 9.0, "SPEAKER_01"),
+            ],
+        )
+
+    def test_short_detection_before_silence_does_not_gain_silence_duration(self) -> None:
+        segments = [
+            main.Segment(0.0, 5.0, "SPEAKER_00"),
+            main.Segment(5.0, 5.2, "SPEAKER_01"),
+            main.Segment(10.0, 12.0, "SPEAKER_00"),
+        ]
+
+        self.assertEqual(
+            main.build_camera_timeline(
+                segments,
+                duration=12.0,
+                fallback_speaker="SPEAKER_00",
+                gap_padding=0.0,
+                min_switch_duration=1.0,
+                silence_threshold=2.5,
+                silence_lookahead=5.0,
+            ),
+            [main.Segment(0.0, 12.0, "SPEAKER_00")],
+        )
+
+    def test_post_silence_lookahead_confirms_fragmented_next_speaker(self) -> None:
+        segments = [
+            main.Segment(0.0, 2.0, "SPEAKER_00"),
+            main.Segment(5.0, 5.6, "SPEAKER_01"),
+            main.Segment(6.0, 6.6, "SPEAKER_01"),
+        ]
+
+        self.assertEqual(
+            main.build_camera_timeline(
+                segments,
+                duration=8.0,
+                fallback_speaker="SPEAKER_00",
+                gap_padding=0.0,
+                min_switch_duration=1.0,
+                silence_threshold=2.5,
+                silence_lookahead=5.0,
+            ),
+            [
+                main.Segment(0.0, 5.0, "SPEAKER_00"),
+                main.Segment(5.0, 8.0, "SPEAKER_01"),
+            ],
+        )
+
+    def test_lookahead_does_not_use_speech_outside_five_second_window(self) -> None:
+        segments = [
+            main.Segment(0.0, 2.0, "SPEAKER_00"),
+            main.Segment(5.0, 5.6, "SPEAKER_01"),
+            main.Segment(10.1, 10.7, "SPEAKER_01"),
+        ]
+
+        self.assertEqual(
+            main.build_camera_timeline(
+                segments,
+                duration=12.0,
+                fallback_speaker="SPEAKER_00",
+                gap_padding=0.0,
+                min_switch_duration=1.0,
+                silence_threshold=2.5,
+                silence_lookahead=5.0,
+            ),
+            [main.Segment(0.0, 12.0, "SPEAKER_00")],
         )
 
     def test_brief_middle_detection_does_not_switch_camera(self) -> None:
@@ -97,6 +203,44 @@ class TimelineStabilityTests(unittest.TestCase):
         self.assertEqual(
             main.stabilize_timeline(timeline, min_switch_duration=1.0),
             [main.Segment(0.0, 4.0, "SPEAKER_01")],
+        )
+
+
+class TimelineJsonTests(unittest.TestCase):
+    def test_bom_timeline_preserves_speech_segments_for_reuse(self) -> None:
+        payload = {
+            "speaker_to_camera": {"SPEAKER_00": 0, "SPEAKER_01": 1},
+            "segments": [
+                {"start": 0.0, "end": 3.0, "speaker": "SPEAKER_00"},
+                {"start": 3.0, "end": 6.0, "speaker": "SPEAKER_01"},
+            ],
+            "speech_segments": [
+                {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"},
+                {"start": 3.0, "end": 4.0, "speaker": "SPEAKER_01"},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "speaker_segments.json"
+            path.write_text(json.dumps(payload), encoding="utf-8-sig")
+
+            timeline, mapping = main.read_segments_json(path)
+            speech_segments = main.read_speech_segments_json(path)
+
+        self.assertEqual(mapping, {"SPEAKER_00": 0, "SPEAKER_01": 1})
+        self.assertEqual(
+            timeline,
+            [
+                main.Segment(0.0, 3.0, "SPEAKER_00"),
+                main.Segment(3.0, 6.0, "SPEAKER_01"),
+            ],
+        )
+        self.assertEqual(
+            speech_segments,
+            [
+                main.Segment(0.0, 1.0, "SPEAKER_00"),
+                main.Segment(3.0, 4.0, "SPEAKER_01"),
+            ],
         )
 
 

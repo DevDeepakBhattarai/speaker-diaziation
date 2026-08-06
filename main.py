@@ -213,6 +213,152 @@ def merge_segments(segments: list[Segment], *, gap: float, min_duration: float) 
     return sorted(merged, key=lambda item: (item.start, item.end, item.speaker))
 
 
+def _compact_timeline(timeline: list[Segment]) -> list[Segment]:
+    compacted: list[Segment] = []
+    for item in sorted(timeline, key=lambda segment: (segment.start, segment.end)):
+        if item.end <= item.start:
+            continue
+        if compacted and compacted[-1].speaker == item.speaker:
+            previous = compacted[-1]
+            compacted[-1] = Segment(
+                previous.start,
+                max(previous.end, item.end),
+                previous.speaker,
+            )
+        else:
+            compacted.append(item)
+    return compacted
+
+
+def _speaker_evidence_duration(
+    segments: list[Segment],
+    *,
+    speaker: str,
+    start: float,
+    end: float,
+) -> float:
+    intervals: list[tuple[float, float]] = []
+    for segment in segments:
+        if segment.speaker != speaker or segment.end <= start or segment.start >= end:
+            continue
+        intervals.append((max(start, segment.start), min(end, segment.end)))
+
+    total = 0.0
+    merged_start: float | None = None
+    merged_end: float | None = None
+    for interval_start, interval_end in sorted(intervals):
+        if merged_start is None:
+            merged_start = interval_start
+            merged_end = interval_end
+        elif interval_start <= merged_end:
+            merged_end = max(merged_end, interval_end)
+        else:
+            total += merged_end - merged_start
+            merged_start = interval_start
+            merged_end = interval_end
+
+    if merged_start is not None and merged_end is not None:
+        total += merged_end - merged_start
+    return total
+
+
+def build_camera_timeline(
+    segments: list[Segment],
+    *,
+    duration: float,
+    fallback_speaker: str,
+    gap_padding: float,
+    min_switch_duration: float,
+    silence_threshold: float = 2.5,
+    silence_lookahead: float = 5.0,
+) -> list[Segment]:
+    """Build a camera timeline from real speech onsets.
+
+    Silence never creates a camera change. The last visible speaker stays on
+    screen until a different speaker actually starts a sufficiently substantial
+    turn. After a long silence, a bounded look-ahead can combine fragmented
+    detections from the next speaker before accepting the switch, while the
+    resulting cut still occurs at that speaker's first real speech onset.
+    """
+    normalized = [
+        Segment(
+            max(0.0, min(duration, segment.start)),
+            max(0.0, min(duration, segment.end)),
+            segment.speaker,
+        )
+        for segment in segments
+        if segment.end > segment.start
+    ]
+    normalized = [segment for segment in normalized if segment.end > segment.start]
+    normalized.sort(key=lambda segment: (segment.start, segment.end, segment.speaker))
+
+    if duration <= 0:
+        return []
+    if not normalized:
+        return [Segment(0.0, duration, fallback_speaker)]
+
+    timeline: list[Segment] = []
+    current_speaker = fallback_speaker
+    camera_segment_start = 0.0
+    activity_end = 0.0
+    index = 0
+
+    while index < len(normalized):
+        event_start = normalized[index].start
+        event_segments: list[Segment] = []
+        while index < len(normalized) and abs(normalized[index].start - event_start) <= 1e-9:
+            event_segments.append(normalized[index])
+            index += 1
+
+        silence_before = max(0.0, event_start - activity_end)
+        candidate = max(
+            event_segments,
+            key=lambda segment: (segment.end - segment.start, segment.end, segment.speaker),
+        )
+
+        if candidate.speaker != current_speaker:
+            candidate_duration = candidate.end - candidate.start
+            qualifies = candidate_duration >= min_switch_duration
+
+            if (
+                not qualifies
+                and silence_before >= silence_threshold
+                and silence_lookahead > 0
+            ):
+                lookahead_end = min(duration, candidate.start + silence_lookahead)
+                for future in normalized[index:]:
+                    if future.start >= lookahead_end:
+                        break
+                    if future.speaker != candidate.speaker:
+                        lookahead_end = min(lookahead_end, future.start)
+                        break
+                evidence = _speaker_evidence_duration(
+                    normalized,
+                    speaker=candidate.speaker,
+                    start=candidate.start,
+                    end=lookahead_end,
+                )
+                qualifies = evidence >= min_switch_duration
+
+            if qualifies:
+                if event_start > camera_segment_start:
+                    timeline.append(
+                        Segment(camera_segment_start, event_start, current_speaker)
+                    )
+                current_speaker = candidate.speaker
+                camera_segment_start = event_start
+
+        activity_end = max(
+            activity_end,
+            max(segment.end + max(0.0, gap_padding) for segment in event_segments),
+        )
+
+    if camera_segment_start < duration:
+        timeline.append(Segment(camera_segment_start, duration, current_speaker))
+
+    return _compact_timeline(timeline)
+
+
 def fill_timeline(
     segments: list[Segment],
     *,
@@ -220,52 +366,16 @@ def fill_timeline(
     fallback_speaker: str,
     gap_padding: float,
 ) -> list[Segment]:
-    """Create a complete, non-overlapping active-speaker timeline.
-
-    Pyannote may return nested/overlapping tracks. The previous cursor-based
-    implementation consumed a long outer segment first and silently discarded
-    every later-starting speaker inside it. At each boundary, the most recently
-    started active turn now wins, which lets an interruption temporarily take
-    the camera before the underlying speaker resumes.
-    """
-    normalized: list[Segment] = []
-    for segment in segments:
-        start = max(0.0, min(duration, segment.start - gap_padding))
-        end = max(start, min(duration, segment.end + gap_padding))
-        if end - start > 0.01:
-            normalized.append(Segment(start, end, segment.speaker))
-
-    boundaries = {0.0, duration}
-    for segment in normalized:
-        boundaries.add(segment.start)
-        boundaries.add(segment.end)
-    ordered_boundaries = sorted(boundaries)
-
-    timeline: list[Segment] = []
-    current_speaker = fallback_speaker
-    for start, end in zip(ordered_boundaries, ordered_boundaries[1:]):
-        if end - start <= 0.01:
-            continue
-
-        active = [
-            segment
-            for segment in normalized
-            if segment.start <= start + 1e-9 and segment.end > start + 1e-9
-        ]
-        if active:
-            selected = max(
-                active,
-                key=lambda segment: (segment.start, segment.end, segment.speaker),
-            )
-            current_speaker = selected.speaker
-
-        if timeline and timeline[-1].speaker == current_speaker:
-            previous = timeline[-1]
-            timeline[-1] = Segment(previous.start, end, previous.speaker)
-        else:
-            timeline.append(Segment(start, end, current_speaker))
-
-    return timeline
+    """Create a complete camera timeline without switching on segment endings."""
+    return build_camera_timeline(
+        segments,
+        duration=duration,
+        fallback_speaker=fallback_speaker,
+        gap_padding=gap_padding,
+        min_switch_duration=0.0,
+        silence_threshold=0.0,
+        silence_lookahead=0.0,
+    )
 
 
 def stabilize_timeline(
@@ -610,25 +720,50 @@ def assemble_split_video(
         filter_path.unlink(missing_ok=True)
 
 
-def write_segments_json(path: Path, segments: list[Segment], mapping: dict[str, int]) -> None:
-    payload = {
+def _segments_payload(segments: list[Segment]) -> list[dict[str, float | str]]:
+    return [
+        {"start": item.start, "end": item.end, "speaker": item.speaker}
+        for item in segments
+    ]
+
+
+def write_segments_json(
+    path: Path,
+    segments: list[Segment],
+    mapping: dict[str, int],
+    *,
+    speech_segments: list[Segment] | None = None,
+) -> None:
+    payload: dict[str, object] = {
         "speaker_to_camera": mapping,
-        "segments": [
-            {"start": item.start, "end": item.end, "speaker": item.speaker}
-            for item in segments
-        ],
+        "segments": _segments_payload(segments),
     }
+    if speech_segments is not None:
+        payload["speech_segments"] = _segments_payload(speech_segments)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def read_segments_json(path: Path) -> tuple[list[Segment], dict[str, int]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    mapping = {str(key): int(value) for key, value in payload["speaker_to_camera"].items()}
-    segments = [
+def _parse_segments(payload: object) -> list[Segment]:
+    if not isinstance(payload, list):
+        return []
+    return [
         Segment(float(item["start"]), float(item["end"]), str(item["speaker"]))
-        for item in payload["segments"]
+        for item in payload
+        if isinstance(item, dict)
     ]
-    return segments, mapping
+
+
+def read_segments_json(path: Path) -> tuple[list[Segment], dict[str, int]]:
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    mapping = {str(key): int(value) for key, value in payload["speaker_to_camera"].items()}
+    return _parse_segments(payload["segments"]), mapping
+
+
+def read_speech_segments_json(path: Path) -> list[Segment] | None:
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if "speech_segments" not in payload:
+        return None
+    return _parse_segments(payload["speech_segments"])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -675,12 +810,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-speakers", type=int, help="Maximum speaker count for diarization.")
     parser.add_argument("--merge-gap", type=float, default=0.30)
     parser.add_argument("--min-segment", type=float, default=0.25)
-    parser.add_argument("--gap-padding", type=float, default=0.05)
+    parser.add_argument(
+        "--gap-padding",
+        type=float,
+        default=0.05,
+        help="Extend detected speech endings when measuring silence gaps.",
+    )
     parser.add_argument(
         "--min-switch-duration",
         type=float,
         default=1.0,
-        help="Minimum continuous speaker turn required before changing cameras.",
+        help="Minimum actual speech evidence required before changing cameras.",
+    )
+    parser.add_argument(
+        "--silence-threshold",
+        type=float,
+        default=2.5,
+        help="Silence duration that enables future-speaker confirmation.",
+    )
+    parser.add_argument(
+        "--silence-lookahead",
+        type=float,
+        default=5.0,
+        help="Seconds to inspect after long silence before confirming a fragmented turn.",
     )
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--video-encoder", default="h264_nvenc")
@@ -751,15 +903,43 @@ def main() -> None:
 
     if args.reuse_segments:
         timeline, mapping = read_segments_json(segments_json)
+        speech_segments = read_speech_segments_json(segments_json)
+        mapping_source = speech_segments or timeline
         if args.mode == MODE_SPLIT_VIDEO:
             mapping = speaker_indexes_by_detection_order(
-                timeline,
+                mapping_source,
                 first_camera_index=first_camera_index,
             )
-        timeline = stabilize_timeline(
-            timeline,
-            min_switch_duration=args.min_switch_duration,
-        )
+        if speech_segments:
+            fallback_speaker = min(
+                speech_segments,
+                key=lambda segment: (segment.start, segment.end),
+            ).speaker
+            timeline = build_camera_timeline(
+                speech_segments,
+                duration=duration,
+                fallback_speaker=fallback_speaker,
+                gap_padding=args.gap_padding,
+                min_switch_duration=args.min_switch_duration,
+                silence_threshold=args.silence_threshold,
+                silence_lookahead=args.silence_lookahead,
+            )
+            write_segments_json(
+                segments_json,
+                timeline,
+                mapping,
+                speech_segments=speech_segments,
+            )
+        else:
+            timeline = stabilize_timeline(
+                timeline,
+                min_switch_duration=args.min_switch_duration,
+            )
+            print(
+                "Warning: this legacy timeline has no speech_segments; rerun "
+                "diarization once for silence-aware switching.",
+                file=sys.stderr,
+            )
         print(f"Reused diarization timeline: {segments_json}")
     else:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -787,20 +967,27 @@ def main() -> None:
             gap=args.merge_gap,
             min_duration=args.min_segment,
         )
-        fallback_speaker = next(iter(mapping))
-        timeline = fill_timeline(
+        fallback_speaker = min(
+            raw_segments,
+            key=lambda segment: (segment.start, segment.end),
+        ).speaker
+        timeline = build_camera_timeline(
             merged,
             duration=duration,
             fallback_speaker=fallback_speaker,
             gap_padding=args.gap_padding,
-        )
-        timeline = stabilize_timeline(
-            timeline,
             min_switch_duration=args.min_switch_duration,
+            silence_threshold=args.silence_threshold,
+            silence_lookahead=args.silence_lookahead,
         )
 
         segments_json.parent.mkdir(parents=True, exist_ok=True)
-        write_segments_json(segments_json, timeline, mapping)
+        write_segments_json(
+            segments_json,
+            timeline,
+            mapping,
+            speech_segments=merged,
+        )
         print(f"Wrote diarization timeline: {segments_json}")
 
     output_video.parent.mkdir(parents=True, exist_ok=True)

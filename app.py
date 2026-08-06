@@ -59,6 +59,8 @@ def _run_switcher(
     min_segment: float,
     gap_padding: float,
     min_switch_duration: float,
+    silence_threshold: float,
+    silence_lookahead: float,
     loop_speaker_videos: bool,
     render_duration: float | None,
     progress: gr.Progress = gr.Progress(track_tqdm=False),
@@ -119,17 +121,45 @@ def _run_switcher(
             progress(0.12, desc="Reading existing timeline")
             copied_segments = _copy_input(segments_json_file, job_dir, "speaker_segments.json")
             timeline, mapping = pipeline.read_segments_json(copied_segments)
+            speech_segments = pipeline.read_speech_segments_json(copied_segments)
             segments_json = copied_segments
+            mapping_source = speech_segments or timeline
             if split_mode:
                 mapping = pipeline.speaker_indexes_by_detection_order(
-                    timeline,
+                    mapping_source,
                     first_camera_index=first_camera_index,
                 )
-            timeline = pipeline.stabilize_timeline(
-                timeline,
-                min_switch_duration=min_switch_duration,
-            )
-            pipeline.write_segments_json(segments_json, timeline, mapping)
+            if speech_segments:
+                fallback_speaker = min(
+                    speech_segments,
+                    key=lambda segment: (segment.start, segment.end),
+                ).speaker
+                timeline = pipeline.build_camera_timeline(
+                    speech_segments,
+                    duration=duration,
+                    fallback_speaker=fallback_speaker,
+                    gap_padding=gap_padding,
+                    min_switch_duration=min_switch_duration,
+                    silence_threshold=silence_threshold,
+                    silence_lookahead=silence_lookahead,
+                )
+                pipeline.write_segments_json(
+                    segments_json,
+                    timeline,
+                    mapping,
+                    speech_segments=speech_segments,
+                )
+                timeline_details = "Silence-aware speech timeline reused"
+            else:
+                timeline = pipeline.stabilize_timeline(
+                    timeline,
+                    min_switch_duration=min_switch_duration,
+                )
+                pipeline.write_segments_json(segments_json, timeline, mapping)
+                timeline_details = (
+                    "Legacy camera-only timeline reused; rerun diarization once "
+                    "for silence-aware switching"
+                )
         else:
             progress(0.12, desc="Preparing audio")
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -160,17 +190,26 @@ def _run_switcher(
                 gap=merge_gap,
                 min_duration=min_segment,
             )
-            timeline = pipeline.fill_timeline(
+            fallback_speaker = min(
+                raw_segments,
+                key=lambda segment: (segment.start, segment.end),
+            ).speaker
+            timeline = pipeline.build_camera_timeline(
                 merged,
                 duration=duration,
-                fallback_speaker=next(iter(mapping)),
+                fallback_speaker=fallback_speaker,
                 gap_padding=gap_padding,
-            )
-            timeline = pipeline.stabilize_timeline(
-                timeline,
                 min_switch_duration=min_switch_duration,
+                silence_threshold=silence_threshold,
+                silence_lookahead=silence_lookahead,
             )
-            pipeline.write_segments_json(segments_json, timeline, mapping)
+            pipeline.write_segments_json(
+                segments_json,
+                timeline,
+                mapping,
+                speech_segments=merged,
+            )
+            timeline_details = "Silence-aware speech timeline generated"
 
         progress(0.72, desc="Rendering switched video with FFmpeg")
         if split_mode:
@@ -213,7 +252,10 @@ def _run_switcher(
             f"Done in {elapsed / 60:.1f} minutes.\n"
             f"Mode: {mode_details}\n"
             f"Audio: {audio_details}\n"
-            f"Minimum camera hold: {min_switch_duration:.2f} seconds\n"
+            f"Minimum spoken turn: {min_switch_duration:.2f} seconds\n"
+            f"Long-silence confirmation: {silence_threshold:.2f}s silence, "
+            f"{silence_lookahead:.2f}s look-ahead\n"
+            f"Timeline behavior: {timeline_details}\n"
             f"Output: {output_video}\n"
             f"Timeline: {segments_json}\n"
             f"Encoder: {encoder}; hwaccel: {selected_hwaccel or 'none'}"
@@ -319,7 +361,8 @@ def build_app() -> gr.Blocks:
 
         with gr.Accordion("Camera switching", open=True):
             gr.Markdown(
-                "Short detections are ignored so the output does not flicker between people."
+                "Silence keeps the last speaker visible. A camera cut happens only when "
+                "another speaker begins a confirmed spoken turn."
             )
             with gr.Row():
                 min_switch_duration = gr.Slider(
@@ -327,7 +370,7 @@ def build_app() -> gr.Blocks:
                     3.0,
                     value=1.0,
                     step=0.05,
-                    label="Minimum speaker turn before switching (seconds)",
+                    label="Minimum actual speech before switching (seconds)",
                 )
                 merge_gap = gr.Slider(
                     0.0,
@@ -335,6 +378,26 @@ def build_app() -> gr.Blocks:
                     value=0.30,
                     step=0.05,
                     label="Merge nearby detections (seconds)",
+                )
+            with gr.Row():
+                silence_threshold = gr.Slider(
+                    0.0,
+                    10.0,
+                    value=2.5,
+                    step=0.1,
+                    label="Long silence threshold (seconds)",
+                    info=(
+                        "After this much silence, fragmented speech is confirmed "
+                        "using look-ahead."
+                    ),
+                )
+                silence_lookahead = gr.Slider(
+                    0.0,
+                    10.0,
+                    value=5.0,
+                    step=0.25,
+                    label="Post-silence look-ahead (seconds)",
+                    info="The cut still occurs when the next confirmed speaker starts talking.",
                 )
 
         with gr.Accordion("Speed and quality", open=False):
@@ -389,7 +452,7 @@ def build_app() -> gr.Blocks:
                     1.0,
                     value=0.05,
                     step=0.01,
-                    label="Speaker boundary padding",
+                    label="Speech-end padding for silence detection",
                 )
 
         run_button = gr.Button("Create switched video", variant="primary", size="lg")
@@ -421,6 +484,8 @@ def build_app() -> gr.Blocks:
                 min_segment,
                 gap_padding,
                 min_switch_duration,
+                silence_threshold,
+                silence_lookahead,
                 loop_speaker_videos,
                 render_duration,
             ],
