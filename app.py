@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import shutil
-import tempfile
 import time
 import traceback
 from pathlib import Path
 
 import gradio as gr
 
+import davinci_export
 import main as pipeline
 
 
@@ -16,15 +15,43 @@ OUTPUT_DIR = WORK_DIR / "outputs"
 UI_MODE_SEPARATE = "Two separate speaker videos"
 UI_MODE_SPLIT = "One combined left/right video"
 UI_AUDIO_EMBEDDED = "Use audio from the video"
-UI_AUDIO_SEPARATE = "Upload a separate audio file"
+UI_AUDIO_SEPARATE = "Use a separate local audio file"
 
 
-def _copy_input(path: str, target_dir: Path, name: str) -> Path:
-    source = Path(path)
-    suffix = source.suffix or Path(name).suffix
-    target = target_dir / f"{Path(name).stem}{suffix}"
-    shutil.copy2(source, target)
-    return target
+def _resolve_local_file(path: str | None, label: str) -> Path:
+    if not path or not path.strip():
+        raise gr.Error(f"Enter the full local path for {label}.")
+
+    # Windows Explorer's "Copy as path" includes surrounding quotes.
+    normalized = path.strip().strip('"').strip("'")
+    source = Path(normalized).expanduser()
+    if not source.is_absolute():
+        source = WORK_DIR / source
+    source = source.resolve()
+
+    if not source.is_file():
+        raise gr.Error(f"{label} does not exist or is not a file: {source}")
+    return source
+
+
+def _serve_outputs_in_place(*paths: Path | None) -> None:
+    existing = [path for path in paths if path is not None and path.exists()]
+    if existing:
+        # Prevent Gradio from copying multi-gigabyte outputs into its cache.
+        gr.set_static_paths(paths=existing)
+
+
+def _validate_full_render(output_video: Path, *, expected_duration: float) -> float:
+    rendered_duration = pipeline.media_duration(output_video)
+    duration_tolerance = max(1.0, min(5.0, expected_duration * 0.001))
+    if rendered_duration + duration_tolerance < expected_duration:
+        raise gr.Error(
+            "The rendered video is incomplete: "
+            f"expected approximately {expected_duration:.3f} seconds but FFmpeg produced "
+            f"only {rendered_duration:.3f} seconds. The partial output was left at "
+            f"{output_video} for debugging."
+        )
+    return rendered_duration
 
 
 def _update_input_fields(mode: str, audio_source: str) -> tuple[dict, dict, dict, dict, dict]:
@@ -55,46 +82,41 @@ def _run_switcher(
     video_encoder: str,
     preset: str,
     crf: int,
-    merge_gap: float,
-    min_segment: float,
-    gap_padding: float,
     min_switch_duration: float,
     silence_threshold: float,
     silence_lookahead: float,
     loop_speaker_videos: bool,
-    render_duration: float | None,
+    create_davinci_project: bool,
     progress: gr.Progress = gr.Progress(track_tqdm=False),
-) -> tuple[str | None, str | None, str]:
+) -> tuple[str | None, str | None, str | None, str]:
     split_mode = mode == UI_MODE_SPLIT
     separate_audio = audio_source == UI_AUDIO_SEPARATE
     if separate_audio and not audio_file:
-        raise gr.Error("Upload the separate soundtrack, or choose audio from the video.")
+        raise gr.Error("Enter the separate soundtrack path, or choose audio from the video.")
     if split_mode and not combined_video:
-        raise gr.Error("Upload one combined video with the left and right speakers visible.")
+        raise gr.Error("Enter the path to one combined left/right video.")
     if not split_mode and (not speaker0_video or not speaker1_video):
-        raise gr.Error("Upload both speaker video files.")
+        raise gr.Error("Enter both local speaker-video paths.")
 
     if reuse_segments and not segments_json_file:
-        raise gr.Error("Upload an existing speaker_segments.json file or disable reuse.")
+        raise gr.Error("Enter an existing speaker_segments.json path or disable reuse.")
 
     started = time.perf_counter()
     job_dir = OUTPUT_DIR / time.strftime("%Y%m%d-%H%M%S")
     job_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        progress(0.02, desc="Copying inputs")
+        progress(0.02, desc="Validating local paths")
         speaker0_path: Path | None = None
         speaker1_path: Path | None = None
         combined_path: Path | None = None
         if split_mode:
-            assert combined_video is not None
-            combined_path = _copy_input(combined_video, job_dir, "combined_video")
+            combined_path = _resolve_local_file(combined_video, "the combined video")
             output_video = job_dir / "speaker_split_switched.mp4"
             primary_video_path = combined_path
         else:
-            assert speaker0_video is not None and speaker1_video is not None
-            speaker0_path = _copy_input(speaker0_video, job_dir, "speaker_0")
-            speaker1_path = _copy_input(speaker1_video, job_dir, "speaker_1")
+            speaker0_path = _resolve_local_file(speaker0_video, "the first speaker video")
+            speaker1_path = _resolve_local_file(speaker1_video, "the second speaker video")
             output_video = job_dir / "speaker_switched.mp4"
             primary_video_path = speaker0_path
         segments_json = job_dir / "speaker_segments.json"
@@ -102,16 +124,15 @@ def _run_switcher(
         pipeline.require_tool("ffmpeg")
         pipeline.require_tool("ffprobe")
         if separate_audio:
-            assert audio_file is not None
-            audio_path = _copy_input(audio_file, job_dir, "audio")
-            audio_details = "Separate uploaded audio"
+            audio_path = _resolve_local_file(audio_file, "the separate soundtrack")
+            audio_details = "Separate local audio path"
         else:
             audio_path = primary_video_path
             if not pipeline.media_has_audio(audio_path):
                 raise gr.Error(
-                    "The selected video has no audio track. Upload a separate audio file instead."
+                    "The selected video has no audio track. Enter a separate audio-file path instead."
                 )
-            audio_details = "Audio embedded in the video"
+            audio_details = "Audio embedded in the local video"
         encoder = pipeline.choose_video_encoder(video_encoder)
         selected_hwaccel = pipeline.choose_hwaccel(hwaccel, encoder)
         duration = pipeline.media_duration(audio_path)
@@ -119,86 +140,71 @@ def _run_switcher(
 
         if reuse_segments:
             progress(0.12, desc="Reading existing timeline")
-            copied_segments = _copy_input(segments_json_file, job_dir, "speaker_segments.json")
-            timeline, mapping = pipeline.read_segments_json(copied_segments)
-            speech_segments = pipeline.read_speech_segments_json(copied_segments)
-            segments_json = copied_segments
-            mapping_source = speech_segments or timeline
+            source_segments = _resolve_local_file(
+                segments_json_file, "the existing speaker_segments.json"
+            )
+            timeline, mapping = pipeline.read_segments_json(source_segments)
+            speech_segments = pipeline.read_speech_segments_json(source_segments)
+            exclusive_segments = pipeline.read_exclusive_speech_segments_json(source_segments)
+            mapping_source = exclusive_segments or speech_segments or timeline
             if split_mode:
                 mapping = pipeline.speaker_indexes_by_detection_order(
                     mapping_source,
                     first_camera_index=first_camera_index,
                 )
-            if speech_segments:
+            if exclusive_segments:
                 fallback_speaker = min(
-                    speech_segments,
+                    exclusive_segments,
                     key=lambda segment: (segment.start, segment.end),
                 ).speaker
                 timeline = pipeline.build_camera_timeline(
-                    speech_segments,
+                    exclusive_segments,
                     duration=duration,
                     fallback_speaker=fallback_speaker,
-                    gap_padding=gap_padding,
                     min_switch_duration=min_switch_duration,
                     silence_threshold=silence_threshold,
                     silence_lookahead=silence_lookahead,
                 )
-                pipeline.write_segments_json(
-                    segments_json,
-                    timeline,
-                    mapping,
-                    speech_segments=speech_segments,
-                )
-                timeline_details = "Silence-aware speech timeline reused"
-            else:
-                timeline = pipeline.stabilize_timeline(
-                    timeline,
-                    min_switch_duration=min_switch_duration,
-                )
-                pipeline.write_segments_json(segments_json, timeline, mapping)
-                timeline_details = (
-                    "Legacy camera-only timeline reused; rerun diarization once "
-                    "for silence-aware switching"
-                )
+            pipeline.write_segments_json(
+                segments_json,
+                timeline,
+                mapping,
+                speech_segments=speech_segments,
+                exclusive_speech_segments=exclusive_segments,
+            )
+            timeline_details = (
+                "Camera policy rebuilt from stored untouched Pyannote exclusive diarization"
+                if exclusive_segments
+                else "Legacy stored camera timeline reused unchanged"
+            )
         else:
-            progress(0.12, desc="Preparing audio")
-            with tempfile.TemporaryDirectory() as tmpdir:
-                wav_path = Path(tmpdir) / "source_audio.wav"
-                pipeline.prepare_audio(audio_path, wav_path, 16000)
+            progress(0.20, desc="Running raw-source GPU speaker diarization")
+            raw_segments, exclusive_segments = pipeline.diarize_audio(
+                audio_path,
+                model=model,
+                hf_token=None,
+                device=device,
+                min_speakers=None,
+                max_speakers=None,
+                num_speakers=2,
+            )
 
-                progress(0.28, desc="Running speaker diarization")
-                raw_segments = pipeline.diarize_audio(
-                    wav_path,
-                    model=model,
-                    hf_token=None,
-                    device=device,
-                    min_speakers=None,
-                    max_speakers=None,
-                    num_speakers=2,
-                )
-
-            if not raw_segments:
+            if not raw_segments or not exclusive_segments:
                 raise gr.Error("Diarization produced no speaker segments.")
 
-            progress(0.62, desc="Building persistent speaker timeline")
+            progress(0.62, desc="Building model-native speaker timeline")
             mapping = pipeline.speaker_indexes_by_detection_order(
-                raw_segments,
+                exclusive_segments,
                 first_camera_index=first_camera_index,
             )
-            merged = pipeline.merge_segments(
-                raw_segments,
-                gap=merge_gap,
-                min_duration=min_segment,
-            )
             fallback_speaker = min(
-                raw_segments,
+                exclusive_segments,
                 key=lambda segment: (segment.start, segment.end),
             ).speaker
             timeline = pipeline.build_camera_timeline(
-                merged,
+                exclusive_segments,
                 duration=duration,
                 fallback_speaker=fallback_speaker,
-                gap_padding=gap_padding,
                 min_switch_duration=min_switch_duration,
                 silence_threshold=silence_threshold,
                 silence_lookahead=silence_lookahead,
@@ -207,11 +213,12 @@ def _run_switcher(
                 segments_json,
                 timeline,
                 mapping,
-                speech_segments=merged,
+                speech_segments=raw_segments,
+                exclusive_speech_segments=exclusive_segments,
             )
-            timeline_details = "Silence-aware speech timeline generated"
+            timeline_details = "Camera policy generated from untouched Pyannote exclusive diarization"
 
-        progress(0.72, desc="Rendering switched video with FFmpeg")
+        progress(0.68, desc="Rendering switched video with FFmpeg")
         if split_mode:
             assert combined_path is not None
             pipeline.assemble_split_video(
@@ -226,7 +233,7 @@ def _run_switcher(
                 crf=crf,
                 hwaccel=selected_hwaccel,
                 loop_video=loop_speaker_videos,
-                render_duration=render_duration or None,
+                render_duration=None,
             )
             mode_details = f"Split-video mode; first detected speaker: {first_speaker_side.lower()}"
         else:
@@ -243,25 +250,71 @@ def _run_switcher(
                 crf=crf,
                 hwaccel=selected_hwaccel,
                 loop_cameras=loop_speaker_videos,
-                render_duration=render_duration or None,
+                render_duration=None,
             )
             mode_details = "Two separate speaker videos"
 
+        rendered_duration = _validate_full_render(
+            output_video,
+            expected_duration=duration,
+        )
+
+        davinci_bundle: Path | None = None
+        if create_davinci_project:
+            progress(0.86, desc="Creating portable DaVinci Resolve project")
+            davinci_bundle = job_dir / "speaker_edit.otioz"
+            if split_mode:
+                assert combined_path is not None
+                export_mode = pipeline.MODE_SPLIT_VIDEO
+                export_cameras = [combined_path]
+            else:
+                assert speaker0_path is not None and speaker1_path is not None
+                export_mode = pipeline.MODE_SEPARATE_VIDEOS
+                export_cameras = [speaker0_path, speaker1_path]
+
+            davinci_export.create_davinci_otioz(
+                mode=export_mode,
+                audio_file=audio_path,
+                camera_videos=export_cameras,
+                segments_json=segments_json,
+                timeline=timeline,
+                mapping=mapping,
+                output_bundle=davinci_bundle,
+                encoder=encoder,
+                preset=preset,
+                crf=crf,
+                hwaccel=selected_hwaccel,
+                loop_cameras=loop_speaker_videos,
+                render_duration=None,
+            )
+
         elapsed = time.perf_counter() - started
+        davinci_details = (
+            f"DaVinci project: {davinci_bundle}\n"
+            if davinci_bundle
+            else "DaVinci project: not requested\n"
+        )
         status = (
             f"Done in {elapsed / 60:.1f} minutes.\n"
             f"Mode: {mode_details}\n"
             f"Audio: {audio_details}\n"
-            f"Minimum spoken turn: {min_switch_duration:.2f} seconds\n"
-            f"Long-silence confirmation: {silence_threshold:.2f}s silence, "
-            f"{silence_lookahead:.2f}s look-ahead\n"
+            f"Camera debounce: {min_switch_duration:.2f}s; long silence: "
+            f"{silence_threshold:.2f}s; look-ahead: {silence_lookahead:.2f}s\n"
+            f"Rendered duration: {rendered_duration:.3f} seconds (full source)\n"
             f"Timeline behavior: {timeline_details}\n"
             f"Output: {output_video}\n"
             f"Timeline: {segments_json}\n"
+            f"{davinci_details}"
             f"Encoder: {encoder}; hwaccel: {selected_hwaccel or 'none'}"
         )
+        _serve_outputs_in_place(output_video, segments_json, davinci_bundle)
         progress(1.0, desc="Done")
-        return str(output_video), str(segments_json), status
+        return (
+            str(output_video),
+            str(segments_json),
+            str(davinci_bundle) if davinci_bundle else None,
+            status,
+        )
     except gr.Error:
         raise
     except Exception as exc:
@@ -276,6 +329,11 @@ def build_app() -> gr.Blocks:
             "Create a stable active-speaker video from two camera files, or crop and "
             "switch between the left and right halves of one combined recording."
         )
+        gr.Markdown(
+            "**Large-file mode:** paste full local file paths below. The app reads the "
+            "original files directly, so Gradio does not upload them and the job does not "
+            "make duplicate input copies."
+        )
 
         with gr.Group():
             gr.Markdown("### 1. Choose the video layout")
@@ -286,22 +344,19 @@ def build_app() -> gr.Blocks:
             )
 
             with gr.Row():
-                speaker0_video = gr.File(
-                    label="First detected speaker video",
-                    file_types=["video"],
-                    type="filepath",
+                speaker0_video = gr.Textbox(
+                    label="First detected speaker video - full local path",
+                    placeholder=r"D:\Podcast\episode\camera_left.mp4",
                 )
-                speaker1_video = gr.File(
-                    label="Second detected speaker video",
-                    file_types=["video"],
-                    type="filepath",
+                speaker1_video = gr.Textbox(
+                    label="Second detected speaker video - full local path",
+                    placeholder=r"D:\Podcast\episode\camera_right.mp4",
                 )
 
             with gr.Row():
-                combined_video = gr.File(
-                    label="Combined video (left person | right person)",
-                    file_types=["video"],
-                    type="filepath",
+                combined_video = gr.Textbox(
+                    label="Combined video (left person | right person) - full local path",
+                    placeholder=r"D:\Podcast\episode\combined.mp4",
                     visible=False,
                 )
                 first_speaker_side = gr.Radio(
@@ -323,10 +378,9 @@ def build_app() -> gr.Blocks:
                     "when two separate videos are selected."
                 ),
             )
-            audio_file = gr.File(
-                label="Separate soundtrack / audio file",
-                file_types=["audio"],
-                type="filepath",
+            audio_file = gr.Textbox(
+                label="Separate soundtrack / audio file - full local path",
+                placeholder=r"D:\Podcast\episode\master_audio.wav",
                 visible=False,
             )
 
@@ -353,16 +407,16 @@ def build_app() -> gr.Blocks:
                 label="Reuse an existing speaker_segments.json",
                 value=False,
             )
-            segments_json_file = gr.File(
-                label="Existing speaker_segments.json",
-                file_types=[".json"],
-                type="filepath",
+            segments_json_file = gr.Textbox(
+                label="Existing speaker_segments.json - full local path",
+                placeholder=r"D:\Podcast\episode\speaker_segments.json",
             )
 
         with gr.Accordion("Camera switching", open=True):
             gr.Markdown(
-                "Silence keeps the last speaker visible. A camera cut happens only when "
-                "another speaker begins a confirmed spoken turn."
+                "Pyannote diarization remains untouched. These controls affect only the "
+                "camera timeline sent to FFmpeg: silence holds the current view, and a "
+                "bounded look-ahead can confirm a short turn after a long silence."
             )
             with gr.Row():
                 min_switch_duration = gr.Slider(
@@ -370,26 +424,15 @@ def build_app() -> gr.Blocks:
                     3.0,
                     value=1.0,
                     step=0.05,
-                    label="Minimum actual speech before switching (seconds)",
+                    label="Minimum visible speaker turn (seconds)",
+                    info="Camera-only debounce. Raw diarization is never filtered.",
                 )
-                merge_gap = gr.Slider(
-                    0.0,
-                    2.0,
-                    value=0.30,
-                    step=0.05,
-                    label="Merge nearby detections (seconds)",
-                )
-            with gr.Row():
                 silence_threshold = gr.Slider(
                     0.0,
                     10.0,
                     value=2.5,
                     step=0.1,
                     label="Long silence threshold (seconds)",
-                    info=(
-                        "After this much silence, fragmented speech is confirmed "
-                        "using look-ahead."
-                    ),
                 )
                 silence_lookahead = gr.Slider(
                     0.0,
@@ -397,7 +440,6 @@ def build_app() -> gr.Blocks:
                     value=5.0,
                     step=0.25,
                     label="Post-silence look-ahead (seconds)",
-                    info="The cut still occurs when the next confirmed speaker starts talking.",
                 )
 
         with gr.Accordion("Speed and quality", open=False):
@@ -408,11 +450,6 @@ def build_app() -> gr.Blocks:
                     label="NVENC preset",
                 )
                 crf = gr.Slider(18, 35, value=26, step=1, label="CQ quality")
-                render_duration = gr.Number(
-                    value=None,
-                    label="Render only first N seconds",
-                    precision=1,
-                )
             with gr.Row():
                 device = gr.Dropdown(
                     ["cuda", "auto", "cpu"],
@@ -434,33 +471,33 @@ def build_app() -> gr.Blocks:
                 value=False,
             )
 
+        with gr.Accordion("DaVinci Resolve export", open=True):
+            create_davinci_project = gr.Checkbox(
+                label="Also create a portable DaVinci Resolve project (.otioz)",
+                value=False,
+                info=(
+                    "The bundle contains editable active-speaker cuts, two native-resolution "
+                    "camera-angle exports, master audio, and the timeline manifest. "
+                    "Creating it requires two additional video encodes and can be large."
+                ),
+            )
+
         with gr.Accordion("Advanced diarization", open=False):
             model = gr.Textbox(
                 value=pipeline.DIARIZATION_MODEL,
                 label="Pyannote model",
+                info="Community-1 is the current highest-quality open local Pyannote diarization model.",
             )
-            with gr.Row():
-                min_segment = gr.Slider(
-                    0.0,
-                    2.0,
-                    value=0.20,
-                    step=0.05,
-                    label="Minimum raw detection (seconds)",
-                )
-                gap_padding = gr.Slider(
-                    0.0,
-                    1.0,
-                    value=0.05,
-                    step=0.01,
-                    label="Speech-end padding for silence detection",
-                )
 
         run_button = gr.Button("Create switched video", variant="primary", size="lg")
 
         with gr.Row():
-            output_video = gr.Video(label="Output video")
+            output_video = gr.File(
+                label="Output video (served directly from outputs; no Gradio cache copy)"
+            )
             output_segments = gr.File(label="Stable timeline JSON")
-        status = gr.Textbox(label="Status", lines=8)
+            output_davinci = gr.File(label="DaVinci Resolve project (.otioz)")
+        status = gr.Textbox(label="Status", lines=9)
 
         run_button.click(
             _run_switcher,
@@ -480,16 +517,13 @@ def build_app() -> gr.Blocks:
                 video_encoder,
                 preset,
                 crf,
-                merge_gap,
-                min_segment,
-                gap_padding,
                 min_switch_duration,
                 silence_threshold,
                 silence_lookahead,
                 loop_speaker_videos,
-                render_duration,
+                create_davinci_project,
             ],
-            outputs=[output_video, output_segments, status],
+            outputs=[output_video, output_segments, output_davinci, status],
         )
 
     return demo
@@ -497,6 +531,6 @@ def build_app() -> gr.Blocks:
 
 if __name__ == "__main__":
     build_app().queue(default_concurrency_limit=1).launch(
-        server_name="0.0.0.0",
+        server_name="127.0.0.1",
         server_port=7860,
     )

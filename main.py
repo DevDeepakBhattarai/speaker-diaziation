@@ -11,9 +11,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
+DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
 MODE_SEPARATE_VIDEOS = "separate-videos"
 MODE_SPLIT_VIDEO = "split-video"
+_WINDOWS_DLL_HANDLES: list[object] = []
+
+
+class DiarizationError(RuntimeError):
+    """Raised when local speaker diarization cannot be initialized or run."""
 
 
 @dataclass(frozen=True)
@@ -99,23 +104,77 @@ def choose_video_encoder(requested: str) -> str:
     return "libx264"
 
 
-def prepare_audio(audio_file: Path, output_wav: Path, sample_rate: int) -> None:
-    run(
+def _ensure_torchcodec_ffmpeg_dlls() -> None:
+    """Expose an FFmpeg 4-7 shared build to TorchCodec on Windows.
+
+    TorchCodec 0.7 uses Windows DLL loading rather than the ffmpeg.exe CLI.
+    The regular renderer may use any FFmpeg executable, but diarization needs
+    compatible shared avcodec/avformat DLLs available to the Python process.
+    """
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+    if _WINDOWS_DLL_HANDLES:
+        return
+
+    supported_avcodec = (
+        "avcodec-61.dll",
+        "avcodec-60.dll",
+        "avcodec-59.dll",
+        "avcodec-58.dll",
+    )
+    candidates: list[Path] = []
+
+    configured = os.getenv("FFMPEG_SHARED_BIN")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if entry.strip():
+            candidates.append(Path(entry.strip().strip('"')))
+
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if local_app_data:
+        packages = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
+        if packages.is_dir():
+            for package in packages.glob("*FFmpeg*Shared*"):
+                candidates.extend(package.glob("*/bin"))
+                candidates.extend(package.glob("bin"))
+
+    for candidate in candidates:
+        try:
+            if not candidate.is_dir():
+                continue
+            if not any((candidate / name).is_file() for name in supported_avcodec):
+                continue
+            handle = os.add_dll_directory(str(candidate))
+            _WINDOWS_DLL_HANDLES.append(handle)
+            os.environ["PATH"] = f"{candidate}{os.pathsep}{os.environ.get('PATH', '')}"
+            return
+        except OSError:
+            continue
+
+    raise DiarizationError(
+        "Pyannote 4/TorchCodec requires an FFmpeg 4-7 shared build on Windows. "
+        "Install it with: winget install --id BtbN.FFmpeg.GPL.Shared.7.1 -e"
+    )
+
+
+def _configure_diarization_batch_size(pipeline: object, batch_size: int) -> int:
+    safe_batch_size = max(1, int(batch_size))
+    if hasattr(pipeline, "segmentation_batch_size"):
+        pipeline.segmentation_batch_size = safe_batch_size
+    if hasattr(pipeline, "embedding_batch_size"):
+        pipeline.embedding_batch_size = safe_batch_size
+    return safe_batch_size
+
+
+def _segments_from_annotation(annotation: object) -> list[Segment]:
+    return sorted(
         [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-i",
-            str(audio_file),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            str(sample_rate),
-            "-f",
-            "wav",
-            str(output_wav),
-        ]
+            Segment(float(turn.start), float(turn.end), str(speaker))
+            for turn, _, speaker in annotation.itertracks(yield_label=True)
+        ],
+        key=lambda item: (item.start, item.end, item.speaker),
     )
 
 
@@ -128,21 +187,23 @@ def diarize_audio(
     min_speakers: int | None,
     max_speakers: int | None,
     num_speakers: int | None,
-) -> list[Segment]:
+    batch_size: int = 1,
+) -> tuple[list[Segment], list[Segment]]:
+    _ensure_torchcodec_ffmpeg_dlls()
     try:
         from dotenv import load_dotenv
         import torch
         from pyannote.audio import Pipeline
     except ImportError as exc:
-        raise SystemExit(
-            "Missing Python dependencies. Install pyannote.audio, python-dotenv, and a CUDA-enabled torch build."
+        raise DiarizationError(
+            "Missing Python dependencies. Run `uv sync` to install the Pyannote/CUDA stack."
         ) from exc
 
     load_dotenv()
     token = hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
     if not token:
-        raise SystemExit(
-            "Set HF_TOKEN or pass --hf-token. pyannote diarization models require Hugging Face access."
+        raise DiarizationError(
+            "Set HF_TOKEN or pass --hf-token. Pyannote diarization models require Hugging Face access."
         )
 
     selected_device = device
@@ -152,15 +213,18 @@ def diarize_audio(
     print(f"Loading diarization model on {selected_device}: {model}")
     try:
         pipeline = Pipeline.from_pretrained(model, token=token)
-    except TypeError:
-        pipeline = Pipeline.from_pretrained(model, use_auth_token=token)
     except Exception as exc:
-        raise SystemExit(
-            "Could not load the pyannote diarization model. If this is a 403 error, "
+        raise DiarizationError(
+            "Could not load the Pyannote diarization model. If this is a 403 error, "
             f"accept the Hugging Face model conditions for https://hf.co/{model} "
             "using the same account that created your HF_TOKEN."
         ) from exc
     pipeline.to(torch.device(selected_device))
+
+    # Batch size changes only inference scheduling, not diarization semantics.
+    # Keep it conservative for an 8 GiB GPU while processing the whole source.
+    safe_batch_size = _configure_diarization_batch_size(pipeline, batch_size)
+    print(f"Using diarization GPU batch size: {safe_batch_size}")
 
     options: dict[str, int] = {}
     if num_speakers is not None:
@@ -171,46 +235,17 @@ def diarize_audio(
         if max_speakers is not None:
             options["max_speakers"] = max_speakers
 
-    diarization = pipeline(str(audio_path), **options)
-    segments = [
-        Segment(float(turn.start), float(turn.end), speaker)
-        for turn, _, speaker in diarization.itertracks(yield_label=True)
-    ]
-    return sorted(segments, key=lambda item: (item.start, item.end, item.speaker))
+    output = pipeline(str(audio_path), **options)
+    regular = getattr(output, "speaker_diarization", output)
+    exclusive = getattr(output, "exclusive_speaker_diarization", None)
 
-
-def merge_segments(segments: list[Segment], *, gap: float, min_duration: float) -> list[Segment]:
-    """Merge nearby detections per speaker before discarding short turns.
-
-    Pyannote can split one real utterance into several tiny adjacent detections,
-    including detections interleaved with another speaker's overlapping track.
-    Merging each label independently keeps those real turns intact.
-    """
-    by_speaker: dict[str, list[Segment]] = {}
-    for segment in segments:
-        if segment.end > segment.start:
-            by_speaker.setdefault(segment.speaker, []).append(segment)
-
-    merged: list[Segment] = []
-    for speaker, speaker_segments in by_speaker.items():
-        speaker_merged: list[Segment] = []
-        for segment in sorted(speaker_segments, key=lambda item: (item.start, item.end)):
-            if speaker_merged and segment.start - speaker_merged[-1].end <= gap:
-                previous = speaker_merged[-1]
-                speaker_merged[-1] = Segment(
-                    previous.start,
-                    max(previous.end, segment.end),
-                    speaker,
-                )
-            else:
-                speaker_merged.append(segment)
-        merged.extend(
-            segment
-            for segment in speaker_merged
-            if segment.end - segment.start >= min_duration
-        )
-
-    return sorted(merged, key=lambda item: (item.start, item.end, item.speaker))
+    regular_segments = _segments_from_annotation(regular)
+    exclusive_segments = (
+        _segments_from_annotation(exclusive)
+        if exclusive is not None
+        else regular_segments
+    )
+    return regular_segments, exclusive_segments
 
 
 def _compact_timeline(timeline: list[Segment]) -> list[Segment]:
@@ -267,33 +302,34 @@ def build_camera_timeline(
     *,
     duration: float,
     fallback_speaker: str,
-    gap_padding: float,
-    min_switch_duration: float,
+    min_switch_duration: float = 1.0,
     silence_threshold: float = 2.5,
     silence_lookahead: float = 5.0,
+    gap_padding: float = 0.05,
 ) -> list[Segment]:
-    """Build a camera timeline from real speech onsets.
+    """Convert untouched diarization timestamps into an FFmpeg camera policy.
 
-    Silence never creates a camera change. The last visible speaker stays on
-    screen until a different speaker actually starts a sufficiently substantial
-    turn. After a long silence, a bounded look-ahead can combine fragmented
-    detections from the next speaker before accepting the switch, while the
-    resulting cut still occurs at that speaker's first real speech onset.
+    This function never changes diarization labels or writes back into raw model
+    output. It only decides which camera should be visible. Silence keeps the
+    current camera. Short speaker turns are ignored unless a long preceding
+    silence plus bounded look-ahead provides enough evidence for the new speaker.
     """
-    normalized = [
-        Segment(
-            max(0.0, min(duration, segment.start)),
-            max(0.0, min(duration, segment.end)),
-            segment.speaker,
-        )
-        for segment in segments
-        if segment.end > segment.start
-    ]
-    normalized = [segment for segment in normalized if segment.end > segment.start]
-    normalized.sort(key=lambda segment: (segment.start, segment.end, segment.speaker))
-
     if duration <= 0:
         return []
+
+    normalized = sorted(
+        [
+            Segment(
+                max(0.0, min(duration, segment.start)),
+                max(0.0, min(duration, segment.end)),
+                segment.speaker,
+            )
+            for segment in segments
+            if segment.end > segment.start
+        ],
+        key=lambda segment: (segment.start, segment.end, segment.speaker),
+    )
+    normalized = [segment for segment in normalized if segment.end > segment.start]
     if not normalized:
         return [Segment(0.0, duration, fallback_speaker)]
 
@@ -317,8 +353,7 @@ def build_camera_timeline(
         )
 
         if candidate.speaker != current_speaker:
-            candidate_duration = candidate.end - candidate.start
-            qualifies = candidate_duration >= min_switch_duration
+            qualifies = candidate.end - candidate.start >= min_switch_duration
 
             if (
                 not qualifies
@@ -332,13 +367,12 @@ def build_camera_timeline(
                     if future.speaker != candidate.speaker:
                         lookahead_end = min(lookahead_end, future.start)
                         break
-                evidence = _speaker_evidence_duration(
+                qualifies = _speaker_evidence_duration(
                     normalized,
                     speaker=candidate.speaker,
                     start=candidate.start,
                     end=lookahead_end,
-                )
-                qualifies = evidence >= min_switch_duration
+                ) >= min_switch_duration
 
             if qualifies:
                 if event_start > camera_segment_start:
@@ -357,80 +391,6 @@ def build_camera_timeline(
         timeline.append(Segment(camera_segment_start, duration, current_speaker))
 
     return _compact_timeline(timeline)
-
-
-def fill_timeline(
-    segments: list[Segment],
-    *,
-    duration: float,
-    fallback_speaker: str,
-    gap_padding: float,
-) -> list[Segment]:
-    """Create a complete camera timeline without switching on segment endings."""
-    return build_camera_timeline(
-        segments,
-        duration=duration,
-        fallback_speaker=fallback_speaker,
-        gap_padding=gap_padding,
-        min_switch_duration=0.0,
-        silence_threshold=0.0,
-        silence_lookahead=0.0,
-    )
-
-
-def stabilize_timeline(
-    timeline: list[Segment],
-    *,
-    min_switch_duration: float,
-) -> list[Segment]:
-    """Debounce camera changes while preserving substantial speaker turns.
-
-    A camera only changes when the other speaker remains active for at least
-    ``min_switch_duration`` seconds. Short interior detections are absorbed into
-    the surrounding camera hold, preventing one-frame or sub-second flicker.
-    """
-    compacted: list[Segment] = []
-    for item in sorted(timeline, key=lambda segment: (segment.start, segment.end)):
-        if item.end <= item.start:
-            continue
-        if compacted and compacted[-1].speaker == item.speaker:
-            previous = compacted[-1]
-            compacted[-1] = Segment(previous.start, max(previous.end, item.end), previous.speaker)
-        else:
-            compacted.append(item)
-
-    if min_switch_duration <= 0 or len(compacted) < 2:
-        return compacted
-
-    changed = True
-    while changed and len(compacted) > 1:
-        changed = False
-        stabilized: list[Segment] = []
-        for index, item in enumerate(compacted):
-            duration = item.end - item.start
-            if duration >= min_switch_duration:
-                stabilized.append(item)
-                continue
-
-            changed = True
-            if stabilized:
-                previous = stabilized[-1]
-                stabilized[-1] = Segment(previous.start, item.end, previous.speaker)
-            elif index + 1 < len(compacted):
-                next_item = compacted[index + 1]
-                compacted[index + 1] = Segment(item.start, next_item.end, next_item.speaker)
-            else:
-                stabilized.append(item)
-
-        compacted = []
-        for item in stabilized:
-            if compacted and compacted[-1].speaker == item.speaker:
-                previous = compacted[-1]
-                compacted[-1] = Segment(previous.start, item.end, previous.speaker)
-            else:
-                compacted.append(item)
-
-    return compacted
 
 
 def speaker_indexes_by_detection_order(
@@ -525,12 +485,11 @@ def ffmpeg_filter_for_split_video_segments(
 
     right_x = source_width - output_width
     active_expression = speaker1_active_expression(timeline, mapping)
+    crop_x = f"if(gt({active_expression}\\,0)\\,{right_x}\\,0)"
     filter_text = (
-        "[0:v]setpts=PTS-STARTPTS,split=2[left_source][right_source];\n"
-        f"[left_source]crop={output_width}:{output_height}:0:0,setsar=1[left];\n"
-        f"[right_source]crop={output_width}:{output_height}:{right_x}:0,setsar=1[right];\n"
-        f"[left][right]overlay=enable='gt({active_expression}\\,0)':"
-        f"x=0:y=0:eof_action=repeat:repeatlast=1[{output_label}]"
+        "[0:v]setpts=PTS-STARTPTS,"
+        f"crop={output_width}:{output_height}:x='{crop_x}':y=0,"
+        f"setsar=1[{output_label}]"
     )
     return filter_text, output_label, output_width, output_height
 
@@ -733,6 +692,7 @@ def write_segments_json(
     mapping: dict[str, int],
     *,
     speech_segments: list[Segment] | None = None,
+    exclusive_speech_segments: list[Segment] | None = None,
 ) -> None:
     payload: dict[str, object] = {
         "speaker_to_camera": mapping,
@@ -740,6 +700,8 @@ def write_segments_json(
     }
     if speech_segments is not None:
         payload["speech_segments"] = _segments_payload(speech_segments)
+    if exclusive_speech_segments is not None:
+        payload["exclusive_speech_segments"] = _segments_payload(exclusive_speech_segments)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -764,6 +726,13 @@ def read_speech_segments_json(path: Path) -> list[Segment] | None:
     if "speech_segments" not in payload:
         return None
     return _parse_segments(payload["speech_segments"])
+
+
+def read_exclusive_speech_segments_json(path: Path) -> list[Segment] | None:
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if "exclusive_speech_segments" not in payload:
+        return None
+    return _parse_segments(payload["exclusive_speech_segments"])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -808,33 +777,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-speakers", type=int, default=2, help="Exact speaker count for diarization.")
     parser.add_argument("--min-speakers", type=int, help="Minimum speaker count for diarization.")
     parser.add_argument("--max-speakers", type=int, help="Maximum speaker count for diarization.")
-    parser.add_argument("--merge-gap", type=float, default=0.30)
-    parser.add_argument("--min-segment", type=float, default=0.25)
-    parser.add_argument(
-        "--gap-padding",
-        type=float,
-        default=0.05,
-        help="Extend detected speech endings when measuring silence gaps.",
-    )
     parser.add_argument(
         "--min-switch-duration",
         type=float,
         default=1.0,
-        help="Minimum actual speech evidence required before changing cameras.",
+        help="Camera-only debounce: minimum spoken evidence before switching views.",
     )
     parser.add_argument(
         "--silence-threshold",
         type=float,
         default=2.5,
-        help="Silence duration that enables future-speaker confirmation.",
+        help="Camera-only silence duration that enables speaker look-ahead.",
     )
     parser.add_argument(
         "--silence-lookahead",
         type=float,
         default=5.0,
-        help="Seconds to inspect after long silence before confirming a fragmented turn.",
+        help="Camera-only seconds to inspect after long silence before switching.",
     )
-    parser.add_argument("--sample-rate", type=int, default=16000)
+    parser.add_argument(
+        "--gap-padding",
+        type=float,
+        default=0.05,
+        help="Camera-only speech-end padding when measuring silence gaps.",
+    )
     parser.add_argument("--video-encoder", default="h264_nvenc")
     parser.add_argument("--audio-codec", default="aac")
     parser.add_argument("--preset", default="p4", help="Encoder preset. For NVENC, p1 is fastest.")
@@ -904,81 +870,58 @@ def main() -> None:
     if args.reuse_segments:
         timeline, mapping = read_segments_json(segments_json)
         speech_segments = read_speech_segments_json(segments_json)
-        mapping_source = speech_segments or timeline
+        exclusive_segments = read_exclusive_speech_segments_json(segments_json)
+        mapping_source = exclusive_segments or speech_segments or timeline
         if args.mode == MODE_SPLIT_VIDEO:
             mapping = speaker_indexes_by_detection_order(
                 mapping_source,
                 first_camera_index=first_camera_index,
             )
-        if speech_segments:
+        if exclusive_segments:
             fallback_speaker = min(
-                speech_segments,
+                exclusive_segments,
                 key=lambda segment: (segment.start, segment.end),
             ).speaker
             timeline = build_camera_timeline(
-                speech_segments,
+                exclusive_segments,
                 duration=duration,
                 fallback_speaker=fallback_speaker,
-                gap_padding=args.gap_padding,
                 min_switch_duration=args.min_switch_duration,
                 silence_threshold=args.silence_threshold,
                 silence_lookahead=args.silence_lookahead,
-            )
-            write_segments_json(
-                segments_json,
-                timeline,
-                mapping,
-                speech_segments=speech_segments,
-            )
-        else:
-            timeline = stabilize_timeline(
-                timeline,
-                min_switch_duration=args.min_switch_duration,
-            )
-            print(
-                "Warning: this legacy timeline has no speech_segments; rerun "
-                "diarization once for silence-aware switching.",
-                file=sys.stderr,
+                gap_padding=args.gap_padding,
             )
         print(f"Reused diarization timeline: {segments_json}")
     else:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            audio_path = Path(tmpdir) / "source_audio.wav"
-            prepare_audio(audio_file, audio_path, args.sample_rate)
-            raw_segments = diarize_audio(
-                audio_path,
-                model=args.model,
-                hf_token=args.hf_token,
-                device=args.device,
-                min_speakers=args.min_speakers,
-                max_speakers=args.max_speakers,
-                num_speakers=args.num_speakers,
-            )
+        raw_segments, exclusive_segments = diarize_audio(
+            audio_file,
+            model=args.model,
+            hf_token=args.hf_token,
+            device=args.device,
+            min_speakers=args.min_speakers,
+            max_speakers=args.max_speakers,
+            num_speakers=args.num_speakers,
+        )
 
-        if not raw_segments:
+        if not raw_segments or not exclusive_segments:
             raise SystemExit("Diarization produced no speaker segments.")
 
         mapping = speaker_indexes_by_detection_order(
-            raw_segments,
+            exclusive_segments,
             first_camera_index=first_camera_index,
         )
-        merged = merge_segments(
-            raw_segments,
-            gap=args.merge_gap,
-            min_duration=args.min_segment,
-        )
         fallback_speaker = min(
-            raw_segments,
+            exclusive_segments,
             key=lambda segment: (segment.start, segment.end),
         ).speaker
         timeline = build_camera_timeline(
-            merged,
+            exclusive_segments,
             duration=duration,
             fallback_speaker=fallback_speaker,
-            gap_padding=args.gap_padding,
             min_switch_duration=args.min_switch_duration,
             silence_threshold=args.silence_threshold,
             silence_lookahead=args.silence_lookahead,
+            gap_padding=args.gap_padding,
         )
 
         segments_json.parent.mkdir(parents=True, exist_ok=True)
@@ -986,7 +929,8 @@ def main() -> None:
             segments_json,
             timeline,
             mapping,
-            speech_segments=merged,
+            speech_segments=raw_segments,
+            exclusive_speech_segments=exclusive_segments,
         )
         print(f"Wrote diarization timeline: {segments_json}")
 
@@ -1028,6 +972,8 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except DiarizationError as exc:
+        raise SystemExit(str(exc)) from exc
     except subprocess.CalledProcessError as exc:
         if exc.stdout:
             print(exc.stdout, file=sys.stderr)

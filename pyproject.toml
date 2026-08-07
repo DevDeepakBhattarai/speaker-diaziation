@@ -6,14 +6,22 @@ readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "gradio>=5.0",
-    "huggingface-hub>=0.24,<1",
-    "numpy<2",
-    "pyannote.audio>=3.1,<4",
+    "huggingface-hub>=0.28.1,<1",
+    "pyannote.audio==4.0.7",
     "python-dotenv>=1.0",
-    "speechbrain<1",
-    "torch==2.2.2+cu121",
-    "torchaudio==2.2.2+cu121",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "torchcodec==0.7.0",
 ]
 
 [project.scripts]
 speaker-diarize-switch = "main:main"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
