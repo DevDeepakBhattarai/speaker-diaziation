@@ -223,6 +223,35 @@ class TimelineJsonTests(unittest.TestCase):
         )
 
 
+class SplitVideoEncodingTests(unittest.TestCase):
+    def test_nvenc_lossless_encoding_uses_constant_qp_zero(self) -> None:
+        command: list[str] = []
+        main.append_video_encoding_options(
+            command,
+            encoder="h264_nvenc",
+            preset="p4",
+            crf=26,
+            lossless=True,
+        )
+
+        self.assertEqual(
+            command,
+            ["-preset", "p4", "-tune", "lossless", "-rc", "constqp", "-qp", "0"],
+        )
+
+    def test_x264_lossless_encoding_uses_crf_zero(self) -> None:
+        command: list[str] = []
+        main.append_video_encoding_options(
+            command,
+            encoder="libx264",
+            preset="medium",
+            crf=26,
+            lossless=True,
+        )
+
+        self.assertEqual(command, ["-preset", "medium", "-crf", "0"])
+
+
 class SplitVideoFilterTests(unittest.TestCase):
     def test_combined_video_is_cropped_into_native_halves(self) -> None:
         timeline = [
@@ -239,8 +268,10 @@ class SplitVideoFilterTests(unittest.TestCase):
         )
 
         self.assertEqual(output_label, "outv")
-        self.assertEqual((width, height), (960, 1080))
+        self.assertEqual((width, height), (1920, 1080))
         self.assertIn("crop=960:1080", filter_text)
+        self.assertIn("pad=1920:1080", filter_text)
+        self.assertNotIn("scale=", filter_text)
         self.assertIn("between(t\\,1.000\\,2.000)", filter_text)
         self.assertIn("960", filter_text)
         self.assertNotIn("overlay", filter_text)
@@ -263,10 +294,12 @@ class SplitVideoFilterTests(unittest.TestCase):
         )
 
         self.assertEqual(output_label, "outv")
-        self.assertEqual((width, height), (1920, 2160))
+        self.assertEqual((width, height), (3840, 2160))
         self.assertNotIn("overlay", filter_text)
         self.assertNotIn("split=", filter_text)
         self.assertIn("crop=1920:2160", filter_text)
+        self.assertIn("pad=3840:2160", filter_text)
+        self.assertNotIn("scale=", filter_text)
         self.assertIn("between(t\\,1.000\\,2.000)", filter_text)
         self.assertIn("1920", filter_text)
 

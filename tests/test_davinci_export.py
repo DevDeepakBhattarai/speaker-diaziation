@@ -38,11 +38,11 @@ class DavinciTimelineTests(unittest.TestCase):
         self.assertEqual(proxy_sizes, [(3840, 2160), (4096, 2160)])
         self.assertEqual(crops, [None, None])
 
-    def test_split_camera_layout_keeps_native_4k_pixels_per_half(self) -> None:
+    def test_split_camera_layout_preserves_source_canvas_and_native_crop_pixels(self) -> None:
         timeline_size, proxy_sizes, crops = (
             davinci_export.resolve_camera_export_layout(
                 main.MODE_SPLIT_VIDEO,
-                [(7680, 2160)],
+                [(3840, 2160)],
             )
         )
 
@@ -50,19 +50,20 @@ class DavinciTimelineTests(unittest.TestCase):
         self.assertEqual(proxy_sizes, [(3840, 2160), (3840, 2160)])
         self.assertEqual(
             crops,
-            [(0, 0, 3840, 2160), (3840, 0, 3840, 2160)],
+            [(0, 0, 1920, 2160), (1920, 0, 1920, 2160)],
         )
 
-    def test_proxy_filter_never_scales_native_media(self) -> None:
+    def test_proxy_filter_pads_crop_without_scaling_native_media(self) -> None:
         filter_text = davinci_export._proxy_filter(
             duration=10.0,
-            crop=(0, 0, 3840, 2160),
+            crop=(0, 0, 1920, 2160),
+            output_size=(3840, 2160),
             loop=False,
         )
 
-        self.assertIn("crop=3840:2160:0:0", filter_text)
+        self.assertIn("crop=1920:2160:0:0", filter_text)
+        self.assertIn("pad=3840:2160", filter_text)
         self.assertNotIn("scale=", filter_text)
-        self.assertNotIn(",pad=", filter_text)
 
     def test_build_otio_document_contains_editable_v1_and_master_a1(self) -> None:
         timeline = [

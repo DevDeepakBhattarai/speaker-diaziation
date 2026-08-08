@@ -463,6 +463,23 @@ def ffmpeg_filter_for_segments(
     return filter_text, output_label
 
 
+def split_video_geometry(
+    source_width: int,
+    source_height: int,
+) -> tuple[int, int, int, int]:
+    """Return native half-crop and output-canvas dimensions without scaling."""
+    crop_width = source_width // 2
+    crop_width -= crop_width % 2
+    crop_height = source_height - (source_height % 2)
+    output_width = source_width - (source_width % 2)
+    output_height = crop_height
+    if crop_width < 2 or crop_height < 2:
+        raise SystemExit(
+            f"Combined video is too small to split: {source_width}x{source_height}"
+        )
+    return crop_width, crop_height, output_width, output_height
+
+
 def ffmpeg_filter_for_split_video_segments(
     timeline: list[Segment],
     mapping: dict[str, int],
@@ -471,26 +488,24 @@ def ffmpeg_filter_for_split_video_segments(
     source_height: int,
 ) -> tuple[str, str, int, int]:
     output_label = "outv"
-    output_width = source_width // 2
-    output_height = source_height
+    crop_width, crop_height, output_width, output_height = split_video_geometry(
+        source_width,
+        source_height,
+    )
 
-    # H.264 encoders commonly require even output dimensions. Dropping one edge
-    # pixel is preferable to stretching either person's half of the source frame.
-    output_width -= output_width % 2
-    output_height -= output_height % 2
-    if output_width < 2 or output_height < 2:
-        raise SystemExit(
-            f"Combined video is too small to split: {source_width}x{source_height}"
-        )
-
-    right_x = source_width - output_width
+    right_x = source_width - crop_width
     active_expression = speaker1_active_expression(timeline, mapping)
     crop_x = f"if(gt({active_expression}\\,0)\\,{right_x}\\,0)"
-    filter_text = (
-        "[0:v]setpts=PTS-STARTPTS,"
-        f"crop={output_width}:{output_height}:x='{crop_x}':y=0,"
-        f"setsar=1[{output_label}]"
-    )
+    filters = [
+        "[0:v]setpts=PTS-STARTPTS",
+        f"crop={crop_width}:{crop_height}:x='{crop_x}':y=0",
+    ]
+    if output_width != crop_width:
+        # Keep every retained source pixel at 1:1 density. Padding restores the
+        # original canvas size; unlike scaling, it never invents or stretches pixels.
+        filters.append(f"pad={output_width}:{output_height}:(ow-iw)/2:0:color=black")
+    filters.append("setsar=1")
+    filter_text = ",".join(filters) + f"[{output_label}]"
     return filter_text, output_label, output_width, output_height
 
 
@@ -514,9 +529,15 @@ def append_video_encoding_options(
     encoder: str,
     preset: str,
     crf: int,
+    lossless: bool = False,
 ) -> None:
     if encoder in {"h264_nvenc", "hevc_nvenc"}:
-        command.extend(["-preset", preset, "-cq", str(crf)])
+        if lossless:
+            command.extend(
+                ["-preset", preset, "-tune", "lossless", "-rc", "constqp", "-qp", "0"]
+            )
+        else:
+            command.extend(["-preset", preset, "-cq", str(crf)])
     elif encoder == "libx264":
         x264_preset = (
             preset
@@ -524,7 +545,7 @@ def append_video_encoding_options(
             in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"}
             else "veryfast"
         )
-        command.extend(["-preset", x264_preset, "-crf", str(crf)])
+        command.extend(["-preset", x264_preset, "-crf", "0" if lossless else str(crf)])
 
 
 def assemble_video(
@@ -660,7 +681,13 @@ def assemble_split_video(
             f"{output_width}:{output_height}",
         ]
     )
-    append_video_encoding_options(command, encoder=encoder, preset=preset, crf=crf)
+    append_video_encoding_options(
+        command,
+        encoder=encoder,
+        preset=preset,
+        crf=crf,
+        lossless=True,
+    )
     command.extend(
         [
             "-c:a",

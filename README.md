@@ -132,12 +132,13 @@ the job. The app then returns an additional downloadable project bundle with:
 - two full-length, time-aligned camera-angle proxies,
 - `speaker_segments.json`, `davinci_manifest.json`, and import instructions.
 
-For a combined left/right recording, the bundle contains independently cropped
-left and right camera exports at each half's full native pixel resolution. This
-preserves the split-camera framing when the timeline is imported instead of
-flattening the edit into the rendered MP4. For two separate camera files, each
-source keeps its original resolution. A 4K source therefore remains 4K and is
-never normalized down to the preview/render dimensions.
+For a combined left/right recording, the renderer crops the active half at
+native pixel density and never scales it. The cropped pixels are placed on an
+output canvas matching the source dimensions, so a 3840x2160 source remains
+3840x2160 instead of becoming a 1920-wide render. The unused canvas area is
+padded rather than stretching the crop. Split-video renders and Resolve camera
+exports use lossless video encoding to avoid adding generation loss. For two
+separate camera files, each source keeps its original resolution.
 
 Import the downloaded file in DaVinci Resolve using **File > Import > Timeline**
 and select `speaker_edit.otioz`. Keep the imported timeline frame rate when

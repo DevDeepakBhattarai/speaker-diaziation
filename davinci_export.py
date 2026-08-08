@@ -89,13 +89,19 @@ def _proxy_filter(
     *,
     duration: float,
     crop: tuple[int, int, int, int] | None,
+    output_size: tuple[int, int] | None,
     loop: bool,
 ) -> str:
-    """Build a proxy filter without rescaling native source pixels."""
+    """Build a proxy filter that keeps retained source pixels at 1:1 density."""
     filters: list[str] = []
     if crop is not None:
         crop_x, crop_y, crop_width, crop_height = crop
         filters.append(f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y}")
+        if output_size is not None and output_size != (crop_width, crop_height):
+            output_width, output_height = output_size
+            filters.append(
+                f"pad={output_width}:{output_height}:(ow-iw)/2:0:color=black"
+            )
     filters.append("setsar=1")
     if not loop:
         # The render path repeats the final decoded frame when a camera file ends.
@@ -110,11 +116,13 @@ def generate_video_proxy(
     output: Path,
     duration: float,
     crop: tuple[int, int, int, int] | None,
+    output_size: tuple[int, int] | None,
     encoder: str,
     preset: str,
     crf: int,
     hwaccel: str | None,
     loop: bool,
+    lossless: bool = False,
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     command = ["ffmpeg", "-y", "-hide_banner"]
@@ -132,6 +140,7 @@ def generate_video_proxy(
             _proxy_filter(
                 duration=duration,
                 crop=crop,
+                output_size=output_size,
                 loop=loop,
             ),
             "-an",
@@ -144,6 +153,7 @@ def generate_video_proxy(
         encoder=encoder,
         preset=preset,
         crf=crf,
+        lossless=lossless,
     )
     command.extend(
         [
@@ -172,20 +182,20 @@ def resolve_camera_export_layout(
         if len(camera_sizes) != 1:
             raise ValueError("split-video mode requires one combined source size")
         source_width, source_height = camera_sizes[0]
-        crop_width = source_width // 2
-        crop_width -= crop_width % 2
-        crop_height = source_height - (source_height % 2)
-        if crop_width < 2 or crop_height < 2:
-            raise ValueError(
-                f"combined video is too small to split: {source_width}x{source_height}"
+        try:
+            crop_width, crop_height, output_width, output_height = (
+                pipeline.split_video_geometry(source_width, source_height)
             )
+        except SystemExit as exc:
+            raise ValueError(str(exc)) from exc
         right_x = source_width - crop_width
-        proxy_sizes = [(crop_width, crop_height), (crop_width, crop_height)]
+        output_size = (output_width, output_height)
+        proxy_sizes = [output_size, output_size]
         crops = [
             (0, 0, crop_width, crop_height),
             (right_x, 0, crop_width, crop_height),
         ]
-        return proxy_sizes[0], proxy_sizes, crops
+        return output_size, proxy_sizes, crops
 
     if mode == pipeline.MODE_SEPARATE_VIDEOS:
         if len(camera_sizes) != 2:
@@ -622,11 +632,13 @@ def create_davinci_otioz(
                     output=target,
                     duration=duration,
                     crop=crop,
+                    output_size=(width, height),
                     encoder=encoder,
                     preset=preset,
                     crf=crf,
                     hwaccel=hwaccel,
                     loop=loop_cameras,
+                    lossless=True,
                 )
             camera_names = ["Left Speaker", "Right Speaker"]
         else:
@@ -642,6 +654,7 @@ def create_davinci_otioz(
                     output=target,
                     duration=duration,
                     crop=crop,
+                    output_size=None,
                     encoder=encoder,
                     preset=preset,
                     crf=crf,
