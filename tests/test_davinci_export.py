@@ -27,45 +27,6 @@ class DavinciTimelineTests(unittest.TestCase):
             ],
         )
 
-    def test_separate_camera_layout_preserves_each_native_4k_resolution(self) -> None:
-        timeline_size, proxy_sizes, crops = (
-            davinci_export.resolve_camera_export_layout(
-                main.MODE_SEPARATE_VIDEOS,
-                [(3840, 2160), (4096, 2160)],
-            )
-        )
-
-        self.assertEqual(timeline_size, (3840, 2160))
-        self.assertEqual(proxy_sizes, [(3840, 2160), (4096, 2160)])
-        self.assertEqual(crops, [None, None])
-
-    def test_split_camera_layout_preserves_source_canvas_and_native_crop_pixels(self) -> None:
-        timeline_size, proxy_sizes, crops = (
-            davinci_export.resolve_camera_export_layout(
-                main.MODE_SPLIT_VIDEO,
-                [(3840, 2160)],
-            )
-        )
-
-        self.assertEqual(timeline_size, (3840, 2160))
-        self.assertEqual(proxy_sizes, [(3840, 2160), (3840, 2160)])
-        self.assertEqual(
-            crops,
-            [(0, 0, 1920, 2160), (1920, 0, 1920, 2160)],
-        )
-
-    def test_proxy_filter_pads_crop_without_scaling_native_media(self) -> None:
-        filter_text = davinci_export._proxy_filter(
-            duration=10.0,
-            crop=(0, 0, 1920, 2160),
-            output_size=(3840, 2160),
-            loop=False,
-        )
-
-        self.assertIn("crop=1920:2160:0:0", filter_text)
-        self.assertIn("pad=3840:2160", filter_text)
-        self.assertNotIn("scale=", filter_text)
-
     def test_build_otio_document_contains_editable_v1_and_master_a1(self) -> None:
         timeline = [
             main.Segment(0.0, 2.0, "SPEAKER_00"),
@@ -197,52 +158,80 @@ class OtiozBundleTests(unittest.TestCase):
                     )
 
 
-class DavinciProxyEncodingTests(unittest.TestCase):
-    def test_split_davinci_proxies_use_selected_quality_not_forced_lossless(self) -> None:
-        timeline = [
-            main.Segment(0.0, 1.0, "SPEAKER_00"),
-            main.Segment(1.0, 2.0, "SPEAKER_01"),
-        ]
-        mapping = {"SPEAKER_00": 0, "SPEAKER_01": 1}
+class DavinciBundleTests(unittest.TestCase):
+    """The bundler consumes rendered media; it must never encode anything itself."""
+
+    def _bundle(self, plan: main.RenderPlan, root: Path) -> Path:
+        camera_videos, master_audio = davinci_export.bundle_media_paths(root)
+        for path in (*camera_videos, master_audio):
+            path.write_bytes(b"rendered")
+        segments = root / "speaker_segments.json"
+        segments.write_text("{}", encoding="utf-8")
+        output = root / "speaker_edit.otioz"
+
+        with mock.patch("davinci_export.video_fps", return_value=30.0):
+            return davinci_export.create_davinci_bundle(
+                plan=plan,
+                audio_file=root / "audio.wav",
+                segments_json=segments,
+                timeline=[
+                    main.Segment(0.0, 1.0, "SPEAKER_00"),
+                    main.Segment(1.0, 2.0, "SPEAKER_01"),
+                ],
+                mapping={"SPEAKER_00": 0, "SPEAKER_01": 1},
+                output_bundle=output,
+                camera_videos=camera_videos,
+                master_audio=master_audio,
+                duration=2.0,
+            )
+
+    def test_bundling_rendered_media_runs_no_ffmpeg_at_all(self) -> None:
+        plan = main.build_render_plan(
+            main.MODE_SPLIT_VIDEO,
+            [Path("combined.mp4")],
+            sizes=[(3840, 2160)],
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            combined = root / "combined.mp4"
-            audio = root / "audio.wav"
-            segments = root / "speaker_segments.json"
-            output = root / "speaker_edit.otioz"
-            combined.write_bytes(b"video")
-            audio.write_bytes(b"audio")
-            segments.write_text("{}", encoding="utf-8")
+            with mock.patch("davinci_export.pipeline.run") as run:
+                output = self._bundle(plan, Path(tmpdir))
 
-            with (
-                mock.patch("davinci_export.pipeline.media_duration", return_value=2.0),
-                mock.patch("davinci_export.pipeline.source_video_size", return_value=(3840, 2160)),
-                mock.patch("davinci_export.video_fps", return_value=30.0),
-                mock.patch("davinci_export.generate_video_proxy") as generate_video_proxy,
-                mock.patch("davinci_export.generate_audio_proxy"),
-                mock.patch("davinci_export.write_otioz_bundle"),
-            ):
-                davinci_export.create_davinci_otioz(
-                    mode=main.MODE_SPLIT_VIDEO,
-                    audio_file=audio,
-                    camera_videos=[combined],
-                    segments_json=segments,
-                    timeline=timeline,
-                    mapping=mapping,
-                    output_bundle=output,
-                    encoder="h264_nvenc",
-                    preset="p1",
-                    crf=26,
-                    hwaccel="cuda",
-                    loop_cameras=False,
-                    render_duration=None,
-                )
+            run.assert_not_called()
+            self.assertTrue(output.exists())
 
-            self.assertEqual(generate_video_proxy.call_count, 2)
-            for call in generate_video_proxy.call_args_list:
-                self.assertFalse(call.kwargs.get("lossless", False))
-                self.assertEqual(call.kwargs["crf"], 26)
+    def test_split_bundle_uses_the_native_half_canvas_and_side_labels(self) -> None:
+        plan = main.build_render_plan(
+            main.MODE_SPLIT_VIDEO,
+            [Path("combined.mp4")],
+            sizes=[(3840, 2160)],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = self._bundle(plan, Path(tmpdir))
+            with zipfile.ZipFile(output) as archive:
+                manifest = json.loads(archive.read("davinci_manifest.json"))
+
+        self.assertEqual((manifest["width"], manifest["height"]), (1920, 2160))
+        self.assertEqual(manifest["camera_names"], ["Left Speaker", "Right Speaker"])
+        self.assertEqual(
+            manifest["camera_resolutions"],
+            [{"width": 1920, "height": 2160}, {"width": 1920, "height": 2160}],
+        )
+
+    def test_separate_bundle_uses_the_shared_canvas_of_both_cameras(self) -> None:
+        plan = main.build_render_plan(
+            main.MODE_SEPARATE_VIDEOS,
+            [Path("camera_1.mp4"), Path("camera_2.mp4")],
+            sizes=[(3840, 2160), (4096, 2160)],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = self._bundle(plan, Path(tmpdir))
+            with zipfile.ZipFile(output) as archive:
+                manifest = json.loads(archive.read("davinci_manifest.json"))
+
+        self.assertEqual((manifest["width"], manifest["height"]), (4096, 2160))
+        self.assertEqual(manifest["camera_names"], ["Camera 1", "Camera 2"])
 
 
 if __name__ == "__main__":

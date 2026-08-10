@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,7 +15,13 @@ from pathlib import Path
 DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
 MODE_SEPARATE_VIDEOS = "separate-videos"
 MODE_SPLIT_VIDEO = "split-video"
+
+# Filter-graph labels produced by the unified render pass.
+SWITCHED_LABEL = "switched"
+CAMERA_LABELS = ("camera0", "camera1")
+
 _WINDOWS_DLL_HANDLES: list[object] = []
+_ENCODER_SESSION_LIMITS: dict[str, int] = {}
 
 
 class DiarizationError(RuntimeError):
@@ -430,83 +437,218 @@ def speaker1_active_expression(
     return "+".join(conditions) if conditions else "0"
 
 
-def ffmpeg_filter_for_segments(
-    timeline: list[Segment],
-    mapping: dict[str, int],
-    *,
-    width: int,
-    height: int,
-    use_cuda_overlay: bool,
-) -> tuple[str, str]:
-    output_label = "outv"
-    active_expression = speaker1_active_expression(timeline, mapping)
+def split_video_geometry(source_width: int, source_height: int) -> tuple[int, int]:
+    """Return the native half-crop size of a combined left/right recording.
 
-    if use_cuda_overlay:
-        filter_text = (
-            "[0:v]setpts=PTS-STARTPTS[base];\n"
-            "[1:v]setpts=PTS-STARTPTS[fg];\n"
-            f"[base][fg]overlay_cuda=x='if(gt({active_expression}\\,0)\\,0\\,{width})':"
-            f"y=0:eof_action=repeat:repeatlast=1[{output_label}]"
-        )
-        return filter_text, output_label
-
-    filter_text = (
-        f"[0:v]setpts=PTS-STARTPTS,scale={width}:{height}:"
-        f"force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1[base];\n"
-        f"[1:v]setpts=PTS-STARTPTS,scale={width}:{height}:"
-        f"force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1[fg];\n"
-        f"[base][fg]overlay=enable='gt({active_expression}\\,0)':"
-        f"x=0:y=0:eof_action=repeat:repeatlast=1[{output_label}]"
-    )
-    return filter_text, output_label
-
-
-def split_video_geometry(
-    source_width: int,
-    source_height: int,
-) -> tuple[int, int, int, int]:
-    """Return native half-crop and output-canvas dimensions without scaling."""
+    The crop is the output: each speaker's own pixels are kept at 1:1 density
+    and delivered as-is. Padding them back onto the full source canvas would
+    add nothing but black bars for the encoder to chew through.
+    """
     crop_width = source_width // 2
     crop_width -= crop_width % 2
     crop_height = source_height - (source_height % 2)
-    output_width = source_width - (source_width % 2)
-    output_height = crop_height
     if crop_width < 2 or crop_height < 2:
         raise SystemExit(
             f"Combined video is too small to split: {source_width}x{source_height}"
         )
-    return crop_width, crop_height, output_width, output_height
+    return crop_width, crop_height
 
 
-def ffmpeg_filter_for_split_video_segments(
-    timeline: list[Segment],
+@dataclass(frozen=True)
+class CameraAngle:
+    """One camera view: an FFmpeg input plus the native crop that isolates it."""
+
+    input_index: int
+    source_size: tuple[int, int]
+    crop: tuple[int, int, int, int] | None = None
+
+    @property
+    def size(self) -> tuple[int, int]:
+        if self.crop is None:
+            return self.source_size
+        return self.crop[2], self.crop[3]
+
+
+@dataclass(frozen=True)
+class RenderPlan:
+    """Mode-independent description of the two camera angles and their canvas.
+
+    Both input modes reduce to the same thing: two camera angles drawn on one
+    shared canvas. A combined recording contributes two crops of a single input;
+    two camera files contribute one uncropped angle each. Everything downstream
+    - the switched render, the Resolve camera media, and the OTIO document -
+    reads this plan instead of branching on the mode.
+    """
+
+    mode: str
+    video_inputs: tuple[Path, ...]
+    cameras: tuple[CameraAngle, CameraAngle]
+    canvas: tuple[int, int]
+    camera_names: tuple[str, str]
+
+    @property
+    def canvas_width(self) -> int:
+        return self.canvas[0]
+
+    @property
+    def canvas_height(self) -> int:
+        return self.canvas[1]
+
+
+def build_render_plan(
+    mode: str,
+    videos: Sequence[Path],
+    *,
+    sizes: Sequence[tuple[int, int]] | None = None,
+) -> RenderPlan:
+    """Reduce either input mode to the same two-angle render plan."""
+    videos = tuple(videos)
+    if sizes is None:
+        sizes = [source_video_size(path) for path in videos]
+    if len(sizes) != len(videos):
+        raise SystemExit("Each video input needs exactly one source size")
+
+    if mode == MODE_SPLIT_VIDEO:
+        if len(videos) != 1:
+            raise SystemExit("split-video mode needs exactly one combined video")
+        source_width, source_height = sizes[0]
+        crop_width, crop_height = split_video_geometry(source_width, source_height)
+        right_x = source_width - crop_width
+        return RenderPlan(
+            mode=mode,
+            video_inputs=videos,
+            cameras=(
+                CameraAngle(0, sizes[0], (0, 0, crop_width, crop_height)),
+                CameraAngle(0, sizes[0], (right_x, 0, crop_width, crop_height)),
+            ),
+            canvas=(crop_width, crop_height),
+            camera_names=("Left Speaker", "Right Speaker"),
+        )
+
+    if mode == MODE_SEPARATE_VIDEOS:
+        if len(videos) != 2:
+            raise SystemExit("separate-videos mode needs exactly two camera videos")
+        cameras: list[CameraAngle] = []
+        for input_index, size in enumerate(sizes):
+            width, height = size
+            even = (width - (width % 2), height - (height % 2))
+            if even[0] < 2 or even[1] < 2:
+                raise SystemExit(f"Camera video is too small: {width}x{height}")
+            crop = None if even == size else (0, 0, even[0], even[1])
+            cameras.append(CameraAngle(input_index, size, crop))
+        # The canvas is the per-axis maximum so neither angle is ever downscaled;
+        # a smaller angle is padded onto it instead of being stretched to fit.
+        canvas = (
+            max(camera.size[0] for camera in cameras),
+            max(camera.size[1] for camera in cameras),
+        )
+        return RenderPlan(
+            mode=mode,
+            video_inputs=videos,
+            cameras=(cameras[0], cameras[1]),
+            canvas=canvas,
+            camera_names=("Camera 1", "Camera 2"),
+        )
+
+    raise SystemExit(f"Unsupported mode: {mode}")
+
+
+def camera_filter_chain(camera: CameraAngle, canvas: tuple[int, int]) -> list[str]:
+    """Isolate one angle and centre it on the shared canvas at native density.
+
+    Nothing is ever scaled. Cropping selects the angle's own pixels and padding
+    restores the canvas, so a 3840x2160 source stays 3840x2160 without inventing
+    or stretching a single pixel.
+    """
+    canvas_width, canvas_height = canvas
+    width, height = camera.size
+    if width > canvas_width or height > canvas_height:
+        raise SystemExit(
+            f"Camera angle {width}x{height} does not fit the "
+            f"{canvas_width}x{canvas_height} canvas"
+        )
+
+    filters: list[str] = []
+    if camera.crop is not None:
+        crop_x, crop_y, crop_width, crop_height = camera.crop
+        filters.append(f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y}")
+    if (width, height) != canvas:
+        filters.append(
+            f"pad={canvas_width}:{canvas_height}:(ow-iw)/2:(oh-ih)/2:color=black"
+        )
+    filters.append("setsar=1")
+    return filters
+
+
+def build_switch_filter_graph(
+    plan: RenderPlan,
+    timeline: Sequence[Segment],
     mapping: dict[str, int],
     *,
-    source_width: int,
-    source_height: int,
-) -> tuple[str, str, int, int]:
-    output_label = "outv"
-    crop_width, crop_height, output_width, output_height = split_video_geometry(
-        source_width,
-        source_height,
-    )
+    wanted: Sequence[str],
+    hold_duration: float | None,
+) -> str:
+    """Build one filter graph that feeds every requested output from one decode.
 
-    right_x = source_width - crop_width
-    active_expression = speaker1_active_expression(timeline, mapping)
-    crop_x = f"if(gt({active_expression}\\,0)\\,{right_x}\\,0)"
-    filters = [
-        "[0:v]setpts=PTS-STARTPTS",
-        f"crop={crop_width}:{crop_height}:x='{crop_x}':y=0",
-    ]
-    if output_width != crop_width:
-        # Keep every retained source pixel at 1:1 density. Padding restores the
-        # original canvas size; unlike scaling, it never invents or stretches pixels.
-        filters.append(f"pad={output_width}:{output_height}:(ow-iw)/2:0:color=black")
-    filters.append("setsar=1")
-    filter_text = ",".join(filters) + f"[{output_label}]"
-    return filter_text, output_label, output_width, output_height
+    `wanted` names the labels the caller will map: the switched programme feed
+    and/or the two full-length camera angles. Each source is decoded once and
+    split only as many ways as the requested outputs actually need.
+    """
+    requested = list(dict.fromkeys(wanted))
+    unknown = set(requested) - {SWITCHED_LABEL, *CAMERA_LABELS}
+    if unknown:
+        raise ValueError(f"unknown render outputs: {sorted(unknown)}")
+    if not requested:
+        raise ValueError("at least one render output is required")
+
+    needed_cameras = {
+        index for index, label in enumerate(CAMERA_LABELS) if label in requested
+    }
+    if SWITCHED_LABEL in requested:
+        needed_cameras |= {0, 1}
+
+    lines: list[str] = []
+    source_label: dict[int, str] = {}
+    consumers: dict[int, list[int]] = {}
+    for index in sorted(needed_cameras):
+        consumers.setdefault(plan.cameras[index].input_index, []).append(index)
+
+    for input_index, camera_indexes in sorted(consumers.items()):
+        labels = [f"src{index}" for index in camera_indexes]
+        head = f"[{input_index}:v]setpts=PTS-STARTPTS"
+        if len(labels) == 1:
+            lines.append(f"{head}[{labels[0]}]")
+        else:
+            # One combined recording feeds both angles, so it is decoded once
+            # and split rather than opened a second time.
+            joined = "".join(f"[{label}]" for label in labels)
+            lines.append(f"{head},split={len(labels)}{joined}")
+        source_label.update(zip(camera_indexes, labels))
+
+    for index in sorted(needed_cameras):
+        chain = camera_filter_chain(plan.cameras[index], plan.canvas)
+        if hold_duration is not None:
+            # Hold the final frame when a camera file is shorter than the
+            # soundtrack, so every output stays aligned to the master audio.
+            chain.append(f"tpad=stop_mode=clone:stop_duration={hold_duration:.3f}")
+
+        sinks: list[str] = []
+        if CAMERA_LABELS[index] in requested:
+            sinks.append(CAMERA_LABELS[index])
+        if SWITCHED_LABEL in requested:
+            sinks.append(f"mix{index}")
+        body = f"[{source_label[index]}]" + ",".join(chain)
+        if len(sinks) > 1:
+            body += f",split={len(sinks)}"
+        lines.append(body + "".join(f"[{sink}]" for sink in sinks))
+
+    if SWITCHED_LABEL in requested:
+        active_expression = speaker1_active_expression(timeline, mapping)
+        lines.append(
+            f"[mix0][mix1]overlay=enable='gt({active_expression}\\,0)':"
+            f"x=0:y=0:eof_action=repeat:repeatlast=1[{SWITCHED_LABEL}]"
+        )
+    return ";\n".join(lines)
 
 
 def choose_hwaccel(requested: str, encoder: str) -> str | None:
@@ -548,161 +690,223 @@ def append_video_encoding_options(
         command.extend(["-preset", x264_preset, "-crf", "0" if lossless else str(crf)])
 
 
-def assemble_video(
+@dataclass(frozen=True)
+class RenderOutputs:
+    """Every artifact the render pass should emit from one decode."""
+
+    switched_video: Path
+    camera_videos: tuple[Path, Path] | None = None
+    master_audio: Path | None = None
+
+    def labels(self) -> list[str]:
+        labels = [SWITCHED_LABEL]
+        if self.camera_videos is not None:
+            labels.extend(CAMERA_LABELS)
+        return labels
+
+
+def _probe_encoder_sessions(encoder: str, count: int) -> bool:
+    command = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        # Comfortably above NVENC's minimum frame size, still trivial to encode.
+        "-i",
+        "color=c=black:s=256x256:r=25:d=0.2",
+    ]
+    for _ in range(count):
+        command.extend(
+            ["-map", "0:v", "-c:v", encoder, "-frames:v", "1", "-f", "null", os.devnull]
+        )
+    try:
+        run(command, quiet=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
+def max_parallel_encoder_sessions(encoder: str, desired: int) -> int:
+    """Return how many simultaneous sessions this encoder will actually open.
+
+    Consumer NVIDIA/Intel/AMD drivers cap concurrent hardware encode sessions.
+    Probing a 64x64 clip up front costs about a second and avoids discovering
+    the limit an hour into a 4K render.
+    """
+    if desired <= 1:
+        return 1
+    if not any(
+        encoder.endswith(suffix) for suffix in ("_nvenc", "_qsv", "_amf", "_vaapi")
+    ):
+        return desired
+
+    cached = _ENCODER_SESSION_LIMITS.get(encoder)
+    if cached is None:
+        cached = 1
+        for count in range(desired, 1, -1):
+            if _probe_encoder_sessions(encoder, count):
+                cached = count
+                break
+        _ENCODER_SESSION_LIMITS[encoder] = cached
+    return min(cached, desired)
+
+
+def _append_video_output(
+    command: list[str],
     *,
-    audio_file: Path,
-    camera_videos: list[Path],
-    output_video: Path,
-    timeline: list[Segment],
-    mapping: dict[str, int],
+    label: str,
+    path: Path,
+    plan: RenderPlan,
     encoder: str,
-    audio_codec: str,
     preset: str,
     crf: int,
-    hwaccel: str | None,
-    loop_cameras: bool,
-    render_duration: float | None,
+    duration: float,
+    audio_input_index: int | None,
+    audio_codec: str,
 ) -> None:
-    width, height = source_video_size(camera_videos[0])
-    filter_text, output_label = ffmpeg_filter_for_segments(
-        timeline,
-        mapping,
-        width=width,
-        height=height,
-        use_cuda_overlay=hwaccel == "cuda" and encoder in {"h264_nvenc", "hevc_nvenc"},
-    )
-
-    with tempfile.NamedTemporaryFile("w", suffix=".ffmpeg", delete=False, encoding="utf-8") as file:
-        filter_path = Path(file.name)
-        file.write(filter_text)
-
-    command = ["ffmpeg", "-y", "-hide_banner"]
-    audio_input_index: int | None = None
-    resolved_audio = audio_file.resolve()
-    for index, video in enumerate(camera_videos):
-        if loop_cameras:
-            command.extend(["-stream_loop", "-1"])
-        if hwaccel:
-            command.extend(["-hwaccel", hwaccel, "-hwaccel_output_format", hwaccel])
-        command.extend(["-i", str(video)])
-        if video.resolve() == resolved_audio:
-            audio_input_index = index
-
+    command.extend(["-map", f"[{label}]"])
     if audio_input_index is None:
-        audio_input_index = len(camera_videos)
-        command.extend(["-i", str(audio_file)])
-
+        command.append("-an")
+    else:
+        command.extend(["-map", f"{audio_input_index}:a:0", "-c:a", audio_codec])
     command.extend(
-        [
-            "-filter_complex_script",
-            str(filter_path),
-            "-map",
-            f"[{output_label}]",
-            "-map",
-            f"{audio_input_index}:a:0",
-            "-c:v",
-            encoder,
-            "-aspect",
-            f"{width}:{height}",
-        ]
+        ["-c:v", encoder, "-aspect", f"{plan.canvas_width}:{plan.canvas_height}"]
     )
     append_video_encoding_options(command, encoder=encoder, preset=preset, crf=crf)
-
     command.extend(
-        [
-            "-c:a",
-            audio_codec,
-            "-max_muxing_queue_size",
-            "4096",
-            "-t",
-            f"{(render_duration or media_duration(audio_file)):.3f}",
-            str(output_video),
-        ]
+        ["-max_muxing_queue_size", "4096", "-t", f"{duration:.3f}", str(path)]
     )
 
-    try:
-        run(command)
-    finally:
-        filter_path.unlink(missing_ok=True)
 
-
-def assemble_split_video(
+def render_pipeline(
     *,
+    plan: RenderPlan,
     audio_file: Path,
-    combined_video: Path,
-    output_video: Path,
-    timeline: list[Segment],
+    timeline: Sequence[Segment],
     mapping: dict[str, int],
+    outputs: RenderOutputs,
     encoder: str,
     audio_codec: str,
     preset: str,
     crf: int,
     hwaccel: str | None,
-    loop_video: bool,
-    render_duration: float | None,
-) -> None:
-    source_width, source_height = source_video_size(combined_video)
-    filter_text, output_label, output_width, output_height = (
-        ffmpeg_filter_for_split_video_segments(
+    loop_videos: bool,
+    duration: float,
+    max_parallel_encodes: int | None = None,
+) -> int:
+    """Render every requested artifact, decoding each source only once.
+
+    The switched programme feed, the two full-length camera angles, and the
+    master audio all come out of a single FFmpeg invocation. Only when the
+    hardware encoder refuses that many concurrent sessions is the work split
+    into the fewest additional passes that fit. Returns the number of passes.
+    """
+    video_labels = outputs.labels()
+    limit = max_parallel_encodes or max_parallel_encoder_sessions(
+        encoder, len(video_labels)
+    )
+    batches = [
+        video_labels[start : start + limit]
+        for start in range(0, len(video_labels), limit)
+    ]
+
+    resolved_audio = audio_file.resolve()
+    audio_input_index: int | None = None
+    for index, video in enumerate(plan.video_inputs):
+        if video.resolve() == resolved_audio:
+            audio_input_index = index
+            break
+    extra_audio_input = audio_input_index is None
+    if audio_input_index is None:
+        audio_input_index = len(plan.video_inputs)
+
+    hold_duration = None if loop_videos else duration
+    for batch_number, batch in enumerate(batches):
+        filter_text = build_switch_filter_graph(
+            plan,
             timeline,
             mapping,
-            source_width=source_width,
-            source_height=source_height,
+            wanted=batch,
+            hold_duration=hold_duration,
         )
-    )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".ffmpeg", delete=False, encoding="utf-8"
+        ) as file:
+            filter_path = Path(file.name)
+            file.write(filter_text)
 
-    with tempfile.NamedTemporaryFile("w", suffix=".ffmpeg", delete=False, encoding="utf-8") as file:
-        filter_path = Path(file.name)
-        file.write(filter_text)
+        command = ["ffmpeg", "-y", "-hide_banner"]
+        for video in plan.video_inputs:
+            if loop_videos:
+                command.extend(["-stream_loop", "-1"])
+            if hwaccel:
+                # Decode on the GPU but hand frames back to system memory: crop,
+                # pad, and overlay are software filters, and the encoders upload
+                # again on their own.
+                command.extend(["-hwaccel", hwaccel])
+            command.extend(["-i", str(video)])
+        if extra_audio_input:
+            command.extend(["-i", str(audio_file)])
+        command.extend(["-filter_complex_script", str(filter_path)])
 
-    command = ["ffmpeg", "-y", "-hide_banner"]
-    if loop_video:
-        command.extend(["-stream_loop", "-1"])
-    if hwaccel:
-        # Keep decoded frames in system memory because crop/overlay are software
-        # filters. Encoding can still use NVENC/AMF/QSV.
-        command.extend(["-hwaccel", hwaccel])
-    command.extend(["-i", str(combined_video)])
-    audio_input_index = 0
-    if combined_video.resolve() != audio_file.resolve():
-        audio_input_index = 1
-        command.extend(["-i", str(audio_file)])
-    command.extend(
-        [
-            "-filter_complex_script",
-            str(filter_path),
-            "-map",
-            f"[{output_label}]",
-            "-map",
-            f"{audio_input_index}:a:0",
-            "-c:v",
-            encoder,
-            "-aspect",
-            f"{output_width}:{output_height}",
-        ]
-    )
-    append_video_encoding_options(
-        command,
-        encoder=encoder,
-        preset=preset,
-        crf=crf,
-    )
-    command.extend(
-        [
-            "-c:a",
-            audio_codec,
-            "-max_muxing_queue_size",
-            "4096",
-            "-t",
-            f"{(render_duration or media_duration(audio_file)):.3f}",
-            str(output_video),
-        ]
-    )
+        for label in batch:
+            if label == SWITCHED_LABEL:
+                _append_video_output(
+                    command,
+                    label=label,
+                    path=outputs.switched_video,
+                    plan=plan,
+                    encoder=encoder,
+                    preset=preset,
+                    crf=crf,
+                    duration=duration,
+                    audio_input_index=audio_input_index,
+                    audio_codec=audio_codec,
+                )
+                continue
+            assert outputs.camera_videos is not None
+            _append_video_output(
+                command,
+                label=label,
+                path=outputs.camera_videos[CAMERA_LABELS.index(label)],
+                plan=plan,
+                encoder=encoder,
+                preset=preset,
+                crf=crf,
+                duration=duration,
+                audio_input_index=None,
+                audio_codec=audio_codec,
+            )
 
-    try:
-        run(command)
-    finally:
-        filter_path.unlink(missing_ok=True)
+        if outputs.master_audio is not None and batch_number == 0:
+            command.extend(
+                [
+                    "-map",
+                    f"{audio_input_index}:a:0",
+                    "-vn",
+                    "-af",
+                    "apad",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-ar",
+                    "48000",
+                    "-t",
+                    f"{duration:.3f}",
+                    str(outputs.master_audio),
+                ]
+            )
+
+        try:
+            run(command)
+        finally:
+            filter_path.unlink(missing_ok=True)
+
+    return len(batches)
 
 
 def _segments_payload(segments: list[Segment]) -> list[dict[str, float | str]]:
@@ -843,6 +1047,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--segments-json", type=Path, default=Path("speaker_segments.json"))
     parser.add_argument(
+        "--davinci-project",
+        type=Path,
+        help=(
+            "Also write a portable DaVinci Resolve .otioz project. Its camera "
+            "angles come out of the same FFmpeg pass as the switched video."
+        ),
+    )
+    parser.add_argument(
         "--reuse-segments",
         action="store_true",
         help="Skip diarization and reuse --segments-json from a previous run.",
@@ -856,11 +1068,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # Imported here because the job orchestrator imports this module back.
+    import job
+
     parser = build_parser()
     args = parser.parse_args()
-
-    require_tool("ffmpeg")
-    require_tool("ffprobe")
 
     if args.speaker0_video is None:
         parser.error("A video file is required.")
@@ -869,130 +1081,62 @@ def main() -> None:
     if args.mode == MODE_SPLIT_VIDEO and args.speaker1_video is not None:
         parser.error("split-video mode accepts exactly one combined video file.")
 
-    audio_file = args.audio_file.resolve()
-    first_video = args.speaker0_video.resolve()
-    second_video = args.speaker1_video.resolve() if args.speaker1_video else None
-    output_video = args.output.resolve()
-
-    input_paths = [audio_file, first_video]
-    if second_video is not None:
-        input_paths.append(second_video)
-    for path in input_paths:
-        if not path.exists():
-            raise SystemExit(f"Input file does not exist: {path}")
-
-    encoder = choose_video_encoder(args.video_encoder)
-    hwaccel = choose_hwaccel(args.hwaccel, encoder)
-    print(f"Using mode: {args.mode}")
-    print(f"Using video encoder: {encoder}")
-    print(f"Using FFmpeg hwaccel: {hwaccel or 'none'}")
-
-    duration = media_duration(audio_file)
+    videos = [args.speaker0_video.resolve()]
+    if args.speaker1_video is not None:
+        videos.append(args.speaker1_video.resolve())
     segments_json = args.segments_json.resolve()
-    first_camera_index = 0
-    if args.mode == MODE_SPLIT_VIDEO and args.first_speaker_side == "right":
-        first_camera_index = 1
 
-    if args.reuse_segments:
-        timeline, mapping = read_segments_json(segments_json)
-        speech_segments = read_speech_segments_json(segments_json)
-        exclusive_segments = read_exclusive_speech_segments_json(segments_json)
-        mapping_source = exclusive_segments or speech_segments or timeline
-        if args.mode == MODE_SPLIT_VIDEO:
-            mapping = speaker_indexes_by_detection_order(
-                mapping_source,
-                first_camera_index=first_camera_index,
-            )
-        if exclusive_segments:
-            fallback_speaker = min(
-                exclusive_segments,
-                key=lambda segment: (segment.start, segment.end),
-            ).speaker
-            timeline = build_camera_timeline(
-                exclusive_segments,
-                duration=duration,
-                fallback_speaker=fallback_speaker,
-                min_switch_duration=args.min_switch_duration,
-                silence_threshold=args.silence_threshold,
-                silence_lookahead=args.silence_lookahead,
-                gap_padding=args.gap_padding,
-            )
-        print(f"Reused diarization timeline: {segments_json}")
-    else:
-        raw_segments, exclusive_segments = diarize_audio(
-            audio_file,
-            model=args.model,
-            hf_token=args.hf_token,
-            device=args.device,
-            min_speakers=args.min_speakers,
-            max_speakers=args.max_speakers,
-            num_speakers=args.num_speakers,
-        )
+    request = job.JobRequest(
+        mode=args.mode,
+        videos=tuple(videos),
+        audio_file=args.audio_file.resolve(),
+        output_video=args.output.resolve(),
+        segments_json=segments_json,
+        davinci_bundle=(
+            args.davinci_project.resolve() if args.davinci_project else None
+        ),
+        first_camera_index=(
+            1
+            if args.mode == MODE_SPLIT_VIDEO and args.first_speaker_side == "right"
+            else 0
+        ),
+        reuse_segments_from=segments_json if args.reuse_segments else None,
+        model=args.model,
+        hf_token=args.hf_token,
+        device=args.device,
+        num_speakers=args.num_speakers,
+        min_speakers=args.min_speakers,
+        max_speakers=args.max_speakers,
+        min_switch_duration=args.min_switch_duration,
+        silence_threshold=args.silence_threshold,
+        silence_lookahead=args.silence_lookahead,
+        gap_padding=args.gap_padding,
+        video_encoder=args.video_encoder,
+        audio_codec=args.audio_codec,
+        preset=args.preset,
+        crf=args.crf,
+        hwaccel=args.hwaccel,
+        loop_videos=args.loop_speaker_videos,
+        render_duration=args.render_duration,
+    )
 
-        if not raw_segments or not exclusive_segments:
-            raise SystemExit("Diarization produced no speaker segments.")
+    print(f"Using mode: {args.mode}")
+    result = job.run_job(request, progress=lambda _, message: print(f"-> {message}"))
 
-        mapping = speaker_indexes_by_detection_order(
-            exclusive_segments,
-            first_camera_index=first_camera_index,
+    print(f"Using video encoder: {result.encoder}")
+    print(f"Using FFmpeg hwaccel: {result.hwaccel or 'none'}")
+    print(f"Wrote diarization timeline: {result.segments_json}")
+    print(f"Wrote switched video: {result.output_video}")
+    for warning in result.warnings:
+        print(f"Note: {warning}")
+    if result.davinci_bundle is not None:
+        print(f"Wrote DaVinci Resolve project: {result.davinci_bundle}")
+    elif result.davinci_error is not None:
+        print(
+            "DaVinci Resolve project failed after a successful render: "
+            f"{result.davinci_error}",
+            file=sys.stderr,
         )
-        fallback_speaker = min(
-            exclusive_segments,
-            key=lambda segment: (segment.start, segment.end),
-        ).speaker
-        timeline = build_camera_timeline(
-            exclusive_segments,
-            duration=duration,
-            fallback_speaker=fallback_speaker,
-            min_switch_duration=args.min_switch_duration,
-            silence_threshold=args.silence_threshold,
-            silence_lookahead=args.silence_lookahead,
-            gap_padding=args.gap_padding,
-        )
-
-        segments_json.parent.mkdir(parents=True, exist_ok=True)
-        write_segments_json(
-            segments_json,
-            timeline,
-            mapping,
-            speech_segments=raw_segments,
-            exclusive_speech_segments=exclusive_segments,
-        )
-        print(f"Wrote diarization timeline: {segments_json}")
-
-    output_video.parent.mkdir(parents=True, exist_ok=True)
-    if args.mode == MODE_SPLIT_VIDEO:
-        assemble_split_video(
-            audio_file=audio_file,
-            combined_video=first_video,
-            output_video=output_video,
-            timeline=timeline,
-            mapping=mapping,
-            encoder=encoder,
-            audio_codec=args.audio_codec,
-            preset=args.preset,
-            crf=args.crf,
-            hwaccel=hwaccel,
-            loop_video=args.loop_speaker_videos,
-            render_duration=args.render_duration,
-        )
-    else:
-        assert second_video is not None
-        assemble_video(
-            audio_file=audio_file,
-            camera_videos=[first_video, second_video],
-            output_video=output_video,
-            timeline=timeline,
-            mapping=mapping,
-            encoder=encoder,
-            audio_codec=args.audio_codec,
-            preset=args.preset,
-            crf=args.crf,
-            hwaccel=hwaccel,
-            loop_cameras=args.loop_speaker_videos,
-            render_duration=args.render_duration,
-        )
-    print(f"Wrote switched video: {output_video}")
 
 
 if __name__ == "__main__":

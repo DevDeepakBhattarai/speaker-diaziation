@@ -6,7 +6,7 @@ from pathlib import Path
 
 import gradio as gr
 
-import davinci_export
+import job
 import main as pipeline
 
 
@@ -107,204 +107,79 @@ def _run_switcher(
 
     try:
         progress(0.02, desc="Validating local paths")
-        speaker0_path: Path | None = None
-        speaker1_path: Path | None = None
-        combined_path: Path | None = None
         if split_mode:
-            combined_path = _resolve_local_file(combined_video, "the combined video")
+            videos = (_resolve_local_file(combined_video, "the combined video"),)
             output_video = job_dir / "speaker_split_switched.mp4"
-            primary_video_path = combined_path
+            mode_details = (
+                f"Split-video mode; first detected speaker: {first_speaker_side.lower()}"
+            )
         else:
-            speaker0_path = _resolve_local_file(speaker0_video, "the first speaker video")
-            speaker1_path = _resolve_local_file(speaker1_video, "the second speaker video")
+            videos = (
+                _resolve_local_file(speaker0_video, "the first speaker video"),
+                _resolve_local_file(speaker1_video, "the second speaker video"),
+            )
             output_video = job_dir / "speaker_switched.mp4"
-            primary_video_path = speaker0_path
-        segments_json = job_dir / "speaker_segments.json"
+            mode_details = "Two separate speaker videos"
 
-        pipeline.require_tool("ffmpeg")
-        pipeline.require_tool("ffprobe")
         if separate_audio:
             audio_path = _resolve_local_file(audio_file, "the separate soundtrack")
             audio_details = "Separate local audio path"
         else:
-            audio_path = primary_video_path
+            audio_path = videos[0]
             if not pipeline.media_has_audio(audio_path):
                 raise gr.Error(
                     "The selected video has no audio track. Enter a separate audio-file path instead."
                 )
             audio_details = "Audio embedded in the local video"
-        encoder = pipeline.choose_video_encoder(video_encoder)
-        selected_hwaccel = pipeline.choose_hwaccel(hwaccel, encoder)
-        duration = pipeline.media_duration(audio_path)
-        first_camera_index = 1 if split_mode and first_speaker_side == "Right" else 0
 
+        reuse_source: Path | None = None
         if reuse_segments:
-            progress(0.12, desc="Reading existing timeline")
-            source_segments = _resolve_local_file(
+            reuse_source = _resolve_local_file(
                 segments_json_file, "the existing speaker_segments.json"
             )
-            timeline, mapping = pipeline.read_segments_json(source_segments)
-            speech_segments = pipeline.read_speech_segments_json(source_segments)
-            exclusive_segments = pipeline.read_exclusive_speech_segments_json(source_segments)
-            mapping_source = exclusive_segments or speech_segments or timeline
-            if split_mode:
-                mapping = pipeline.speaker_indexes_by_detection_order(
-                    mapping_source,
-                    first_camera_index=first_camera_index,
-                )
-            if exclusive_segments:
-                fallback_speaker = min(
-                    exclusive_segments,
-                    key=lambda segment: (segment.start, segment.end),
-                ).speaker
-                timeline = pipeline.build_camera_timeline(
-                    exclusive_segments,
-                    duration=duration,
-                    fallback_speaker=fallback_speaker,
-                    min_switch_duration=min_switch_duration,
-                    silence_threshold=silence_threshold,
-                    silence_lookahead=silence_lookahead,
-                )
-            pipeline.write_segments_json(
-                segments_json,
-                timeline,
-                mapping,
-                speech_segments=speech_segments,
-                exclusive_speech_segments=exclusive_segments,
-            )
-            timeline_details = (
-                "Camera policy rebuilt from stored untouched Pyannote exclusive diarization"
-                if exclusive_segments
-                else "Legacy stored camera timeline reused unchanged"
-            )
-        else:
-            progress(0.20, desc="Running raw-source GPU speaker diarization")
-            raw_segments, exclusive_segments = pipeline.diarize_audio(
-                audio_path,
-                model=model,
-                hf_token=None,
-                device=device,
-                min_speakers=None,
-                max_speakers=None,
-                num_speakers=2,
-            )
 
-            if not raw_segments or not exclusive_segments:
-                raise gr.Error("Diarization produced no speaker segments.")
-
-            progress(0.62, desc="Building model-native speaker timeline")
-            mapping = pipeline.speaker_indexes_by_detection_order(
-                exclusive_segments,
-                first_camera_index=first_camera_index,
-            )
-            fallback_speaker = min(
-                exclusive_segments,
-                key=lambda segment: (segment.start, segment.end),
-            ).speaker
-            timeline = pipeline.build_camera_timeline(
-                exclusive_segments,
-                duration=duration,
-                fallback_speaker=fallback_speaker,
-                min_switch_duration=min_switch_duration,
-                silence_threshold=silence_threshold,
-                silence_lookahead=silence_lookahead,
-            )
-            pipeline.write_segments_json(
-                segments_json,
-                timeline,
-                mapping,
-                speech_segments=raw_segments,
-                exclusive_speech_segments=exclusive_segments,
-            )
-            timeline_details = "Camera policy generated from untouched Pyannote exclusive diarization"
-
-        progress(0.68, desc="Rendering switched video with FFmpeg")
-        if split_mode:
-            assert combined_path is not None
-            pipeline.assemble_split_video(
-                audio_file=audio_path,
-                combined_video=combined_path,
-                output_video=output_video,
-                timeline=timeline,
-                mapping=mapping,
-                encoder=encoder,
-                audio_codec="aac",
-                preset=preset,
-                crf=crf,
-                hwaccel=selected_hwaccel,
-                loop_video=loop_speaker_videos,
-                render_duration=None,
-            )
-            mode_details = f"Split-video mode; first detected speaker: {first_speaker_side.lower()}"
-        else:
-            assert speaker0_path is not None and speaker1_path is not None
-            pipeline.assemble_video(
-                audio_file=audio_path,
-                camera_videos=[speaker0_path, speaker1_path],
-                output_video=output_video,
-                timeline=timeline,
-                mapping=mapping,
-                encoder=encoder,
-                audio_codec="aac",
-                preset=preset,
-                crf=crf,
-                hwaccel=selected_hwaccel,
-                loop_cameras=loop_speaker_videos,
-                render_duration=None,
-            )
-            mode_details = "Two separate speaker videos"
-
-        rendered_duration = _validate_full_render(
-            output_video,
-            expected_duration=duration,
+        request = job.JobRequest(
+            mode=pipeline.MODE_SPLIT_VIDEO if split_mode else pipeline.MODE_SEPARATE_VIDEOS,
+            videos=videos,
+            audio_file=audio_path,
+            output_video=output_video,
+            segments_json=job_dir / "speaker_segments.json",
+            davinci_bundle=job_dir / "speaker_edit.otioz" if create_davinci_project else None,
+            first_camera_index=1 if split_mode and first_speaker_side == "Right" else 0,
+            reuse_segments_from=reuse_source,
+            model=model,
+            device=device,
+            min_switch_duration=min_switch_duration,
+            silence_threshold=silence_threshold,
+            silence_lookahead=silence_lookahead,
+            video_encoder=video_encoder,
+            preset=preset,
+            crf=crf,
+            hwaccel=hwaccel,
+            loop_videos=loop_speaker_videos,
         )
 
-        davinci_bundle: Path | None = None
-        davinci_error: str | None = None
-        if create_davinci_project:
-            progress(0.86, desc="Creating portable DaVinci Resolve project")
-            davinci_bundle = job_dir / "speaker_edit.otioz"
-            if split_mode:
-                assert combined_path is not None
-                export_mode = pipeline.MODE_SPLIT_VIDEO
-                export_cameras = [combined_path]
-            else:
-                assert speaker0_path is not None and speaker1_path is not None
-                export_mode = pipeline.MODE_SEPARATE_VIDEOS
-                export_cameras = [speaker0_path, speaker1_path]
+        result = job.run_job(
+            request,
+            progress=lambda fraction, message: progress(fraction, desc=message),
+        )
+        rendered_duration = _validate_full_render(
+            result.output_video,
+            expected_duration=result.duration,
+        )
 
-            try:
-                davinci_export.create_davinci_otioz(
-                    mode=export_mode,
-                    audio_file=audio_path,
-                    camera_videos=export_cameras,
-                    segments_json=segments_json,
-                    timeline=timeline,
-                    mapping=mapping,
-                    output_bundle=davinci_bundle,
-                    encoder=encoder,
-                    preset=preset,
-                    crf=crf,
-                    hwaccel=selected_hwaccel,
-                    loop_cameras=loop_speaker_videos,
-                    render_duration=None,
-                )
-            except Exception as exc:
-                davinci_bundle.unlink(missing_ok=True)
-                davinci_error = f"{type(exc).__name__}: {exc}"
-                print(f"DaVinci export failed after the video render completed: {davinci_error}")
-                davinci_bundle = None
-
-        elapsed = time.perf_counter() - started
-        if davinci_bundle:
-            davinci_details = f"DaVinci project: {davinci_bundle}\n"
-        elif davinci_error:
+        if result.davinci_bundle is not None:
+            davinci_details = f"DaVinci project: {result.davinci_bundle}\n"
+        elif result.davinci_error is not None:
             davinci_details = (
                 "DaVinci project: export failed, but the rendered video and timeline are valid. "
-                f"{davinci_error}\n"
+                f"{result.davinci_error}\n"
             )
         else:
             davinci_details = "DaVinci project: not requested\n"
+
+        elapsed = time.perf_counter() - started
+        canvas_width, canvas_height = result.plan.canvas
         status = (
             f"Done in {elapsed / 60:.1f} minutes.\n"
             f"Mode: {mode_details}\n"
@@ -312,18 +187,26 @@ def _run_switcher(
             f"Camera debounce: {min_switch_duration:.2f}s; long silence: "
             f"{silence_threshold:.2f}s; look-ahead: {silence_lookahead:.2f}s\n"
             f"Rendered duration: {rendered_duration:.3f} seconds (full source)\n"
-            f"Timeline behavior: {timeline_details}\n"
-            f"Output: {output_video}\n"
-            f"Timeline: {segments_json}\n"
+            f"Canvas: {canvas_width}x{canvas_height} at native pixel density\n"
+            f"Timeline behavior: {result.timeline_details}\n"
+            f"Output: {result.output_video}\n"
+            f"Timeline: {result.segments_json}\n"
             f"{davinci_details}"
-            f"Encoder: {encoder}; hwaccel: {selected_hwaccel or 'none'}"
+            f"FFmpeg passes: {result.ffmpeg_passes}\n"
+            f"Encoder: {result.encoder}; hwaccel: {result.hwaccel or 'none'}"
         )
-        _serve_outputs_in_place(output_video, segments_json, davinci_bundle)
-        progress(1.0, desc="Done")
+        for warning in result.warnings:
+            status += f"\nNote: {warning}"
+
+        _serve_outputs_in_place(
+            result.output_video,
+            result.segments_json,
+            result.davinci_bundle,
+        )
         return (
-            str(output_video),
-            str(segments_json),
-            str(davinci_bundle) if davinci_bundle else None,
+            str(result.output_video),
+            str(result.segments_json),
+            str(result.davinci_bundle) if result.davinci_bundle else None,
             status,
         )
     except gr.Error:
@@ -487,10 +370,10 @@ def build_app() -> gr.Blocks:
                 label="Also create a portable DaVinci Resolve project (.otioz)",
                 value=False,
                 info=(
-                    "The bundle contains editable active-speaker cuts, two native-resolution "
-                    "camera-angle exports, master audio, and the timeline manifest. "
-                    "The proxy encodes use the selected CQ quality instead of lossless QP=0 "
-                    "to keep long 4K projects to a practical size."
+                    "The bundle contains editable active-speaker cuts, two native-density "
+                    "camera angles, master audio, and the timeline manifest. The angles "
+                    "come out of the same FFmpeg pass as the switched video, so this adds "
+                    "two encodes but no extra decoding or re-reading of the source."
                 ),
             )
 

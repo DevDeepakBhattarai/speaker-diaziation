@@ -39,10 +39,11 @@ video is divided vertically into two equal views:
 - left edge to center = left speaker camera
 - center to right edge = right speaker camera
 
-Only the active speaker's half is rendered. The output keeps the cropped half's
-native aspect ratio and dimensions instead of horizontally stretching it.
-Choose whether the first unique speaker detected in the soundtrack is the
-person on the left or the person on the right.
+Only the active speaker's half is rendered, at that half's own native pixel
+density. A 3840x2160 combined recording produces a 1920x2160 output: every
+source pixel of the visible speaker is kept, and nothing is scaled, stretched,
+or padded with black bars. Choose whether the first unique speaker detected in
+the soundtrack is the person on the left or the person on the right.
 
 First detected speaker is on the left:
 
@@ -64,6 +65,22 @@ python main.py .\conversation.wav .\both_speakers.mp4 `
 
 The original command remains unchanged because `separate-videos` is still the
 default mode.
+
+### One pipeline for both modes
+
+Both modes reduce to the same thing before anything is rendered: **two camera
+angles drawn on one shared canvas**. A combined recording contributes two crops
+of a single input; two camera files contribute one uncropped angle each. From
+that point on the camera timeline, the switched render, the Resolve camera
+media, and the OTIO document all read the same render plan, so neither mode has
+a code path of its own.
+
+The canvas is chosen so nothing is ever scaled:
+
+- **split-video** - the canvas is one native half of the source.
+- **separate-videos** - the canvas is the per-axis maximum of the two cameras,
+  so the larger camera stays native and a smaller one is padded onto it rather
+  than being stretched or shrunk to fit.
 
 ## Requirements
 
@@ -129,26 +146,52 @@ the job. The app then returns an additional downloadable project bundle with:
 
 - an editable **V1 - Active Speaker** track containing every diarization cut,
 - a continuous **A1 - Master Audio** track,
-- two full-length, time-aligned camera-angle proxies,
+- two full-length, time-aligned, native-density camera angles,
 - `speaker_segments.json`, `davinci_manifest.json`, and import instructions.
 
-For a combined left/right recording, the renderer crops the active half at
-native pixel density and never scales it. The cropped pixels are placed on an
-output canvas matching the source dimensions, so a 3840x2160 source remains
-3840x2160 instead of becoming a 1920-wide render. The unused canvas area is
-padded rather than stretching the crop. Split-video renders and Resolve camera
-exports keep the selected CQ/CRF quality setting instead of forcing lossless QP=0,
-which avoids extremely large long-form 4K intermediates. For two separate camera
-files, each source keeps its original resolution.
+The same export is available from the CLI:
+
+```powershell
+python main.py .\conversation.wav .\both_speakers.mp4 `
+  --mode split-video `
+  --davinci-project .\speaker_edit.otioz `
+  -o .\out.mp4
+```
 
 Import the downloaded file in DaVinci Resolve using **File > Import > Timeline**
 and select `speaker_edit.otioz`. Keep the imported timeline frame rate when
 Resolve asks. V1 remains editable for trimming or replacing camera cuts, while
 A1 remains a single continuous soundtrack.
 
-The bundle can be large and takes longer to create because it performs two
-additional full-length camera proxy encodes. Leave the checkbox disabled when
-only the rendered video and JSON timeline are needed.
+Enabling the export adds no extra decoding and no extra reads of the source
+files. The camera angles come out of the *same* FFmpeg invocation as the
+switched video, so they are frame-identical to what the render used. It does add
+two more encodes and the bundle itself is large, so leave the checkbox disabled
+when only the rendered video and JSON timeline are needed.
+
+## One FFmpeg Pass
+
+A job that produces everything - the switched video, both Resolve camera angles,
+and the master audio - runs as a single FFmpeg invocation. Each source is
+decoded once, split inside the filter graph, and fed to every output at the same
+time:
+
+```text
+[0:v]setpts=PTS-STARTPTS,split=2[src0][src1];
+[src0]crop=1920:2160:0:0,setsar=1,split=2[camera0][mix0];
+[src1]crop=1920:2160:1920:0,setsar=1,split=2[camera1][mix1];
+[mix0][mix1]overlay=enable='...'[switched]
+```
+
+Renders and Resolve camera exports keep the selected CQ/CRF quality setting
+instead of forcing lossless QP=0, which avoids unusable long-form 4K
+intermediates.
+
+Consumer GPUs cap how many hardware encoder sessions can be open at once. The
+job probes that limit on a tiny clip before starting, so a driver that refuses
+three concurrent sessions falls back to the fewest extra passes that fit rather
+than failing an hour into a 4K render. The status output reports how many passes
+were actually used.
 
 If you already have `speaker_segments.json`, enable timeline reuse to skip
 diarization and only rerender the video. In split-video mode, the selected

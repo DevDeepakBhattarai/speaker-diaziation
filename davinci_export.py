@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any, Sequence
@@ -83,170 +82,6 @@ def video_fps(path: Path) -> float:
             if rate > 0:
                 return rate
     return 30.0
-
-
-def _proxy_filter(
-    *,
-    duration: float,
-    crop: tuple[int, int, int, int] | None,
-    output_size: tuple[int, int] | None,
-    loop: bool,
-) -> str:
-    """Build a proxy filter that keeps retained source pixels at 1:1 density."""
-    filters: list[str] = []
-    if crop is not None:
-        crop_x, crop_y, crop_width, crop_height = crop
-        filters.append(f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y}")
-        if output_size is not None and output_size != (crop_width, crop_height):
-            output_width, output_height = output_size
-            filters.append(
-                f"pad={output_width}:{output_height}:(ow-iw)/2:0:color=black"
-            )
-    filters.append("setsar=1")
-    if not loop:
-        # The render path repeats the final decoded frame when a camera file ends.
-        # Mirror that behavior so the editable Resolve media remains frame-aligned.
-        filters.append(f"tpad=stop_mode=clone:stop_duration={duration:.3f}")
-    return ",".join(filters)
-
-
-def generate_video_proxy(
-    *,
-    source: Path,
-    output: Path,
-    duration: float,
-    crop: tuple[int, int, int, int] | None,
-    output_size: tuple[int, int] | None,
-    encoder: str,
-    preset: str,
-    crf: int,
-    hwaccel: str | None,
-    loop: bool,
-    lossless: bool = False,
-) -> None:
-    output.parent.mkdir(parents=True, exist_ok=True)
-    command = ["ffmpeg", "-y", "-hide_banner"]
-    if loop:
-        command.extend(["-stream_loop", "-1"])
-    if hwaccel:
-        command.extend(["-hwaccel", hwaccel])
-    command.extend(
-        [
-            "-i",
-            str(source),
-            "-map",
-            "0:v:0",
-            "-vf",
-            _proxy_filter(
-                duration=duration,
-                crop=crop,
-                output_size=output_size,
-                loop=loop,
-            ),
-            "-an",
-            "-c:v",
-            encoder,
-        ]
-    )
-    pipeline.append_video_encoding_options(
-        command,
-        encoder=encoder,
-        preset=preset,
-        crf=crf,
-        lossless=lossless,
-    )
-    command.extend(
-        [
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            "-t",
-            f"{duration:.3f}",
-            str(output),
-        ]
-    )
-    pipeline.run(command)
-
-
-def resolve_camera_export_layout(
-    mode: str,
-    camera_sizes: Sequence[tuple[int, int]],
-) -> tuple[
-    tuple[int, int],
-    list[tuple[int, int]],
-    list[tuple[int, int, int, int] | None],
-]:
-    """Return timeline size, native proxy sizes, and crop geometry."""
-    if mode == pipeline.MODE_SPLIT_VIDEO:
-        if len(camera_sizes) != 1:
-            raise ValueError("split-video mode requires one combined source size")
-        source_width, source_height = camera_sizes[0]
-        try:
-            crop_width, crop_height, output_width, output_height = (
-                pipeline.split_video_geometry(source_width, source_height)
-            )
-        except SystemExit as exc:
-            raise ValueError(str(exc)) from exc
-        right_x = source_width - crop_width
-        output_size = (output_width, output_height)
-        proxy_sizes = [output_size, output_size]
-        crops = [
-            (0, 0, crop_width, crop_height),
-            (right_x, 0, crop_width, crop_height),
-        ]
-        return output_size, proxy_sizes, crops
-
-    if mode == pipeline.MODE_SEPARATE_VIDEOS:
-        if len(camera_sizes) != 2:
-            raise ValueError("separate-videos mode requires two source sizes")
-        normalized_sizes = [
-            (width - (width % 2), height - (height % 2))
-            for width, height in camera_sizes
-        ]
-        if any(width < 2 or height < 2 for width, height in normalized_sizes):
-            raise ValueError("camera video dimensions must be at least 2x2")
-        crops = [
-            None
-            if normalized == original
-            else (0, 0, normalized[0], normalized[1])
-            for original, normalized in zip(camera_sizes, normalized_sizes)
-        ]
-        return normalized_sizes[0], normalized_sizes, crops
-
-    raise ValueError(f"unsupported export mode: {mode}")
-
-
-def generate_audio_proxy(
-    *,
-    source: Path,
-    output: Path,
-    duration: float,
-) -> None:
-    output.parent.mkdir(parents=True, exist_ok=True)
-    pipeline.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-i",
-            str(source),
-            "-map",
-            "0:a:0",
-            "-vn",
-            "-af",
-            "apad",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ar",
-            "48000",
-            "-t",
-            f"{duration:.3f}",
-            str(output),
-        ]
-    )
 
 
 def _external_reference(
@@ -511,9 +346,9 @@ def build_manifest(
             for index, item in enumerate(timeline, start=1)
         ],
         "notes": [
-            "The bundled camera proxies are full-length, time-aligned, native-resolution sources for trim freedom in Resolve.",
+            "The bundled camera angles are full-length, time-aligned, native-density sources for trim freedom in Resolve.",
             "The OTIO record timeline preserves the exact camera switches produced by the diarization app.",
-            "The rendered MP4 remains a separate review/output artifact in the Gradio result.",
+            "The camera angles and the rendered MP4 come from the same FFmpeg pass, so they are frame-identical.",
         ],
     }
 
@@ -584,127 +419,78 @@ def write_otioz_bundle(
         partial_output.unlink(missing_ok=True)
 
 
-def create_davinci_otioz(
+CAMERA_MEDIA_NAMES = ("camera_1.mp4", "camera_2.mp4")
+AUDIO_MEDIA_NAME = "master_audio.m4a"
+
+
+def bundle_media_paths(directory: Path) -> tuple[tuple[Path, Path], Path]:
+    """Return the camera and audio media paths the render pass should write."""
+    camera_videos = (
+        directory / CAMERA_MEDIA_NAMES[0],
+        directory / CAMERA_MEDIA_NAMES[1],
+    )
+    return camera_videos, directory / AUDIO_MEDIA_NAME
+
+
+def create_davinci_bundle(
     *,
-    mode: str,
+    plan: pipeline.RenderPlan,
     audio_file: Path,
-    camera_videos: Sequence[Path],
     segments_json: Path,
     timeline: Sequence[pipeline.Segment],
     mapping: dict[str, int],
     output_bundle: Path,
-    encoder: str,
-    preset: str,
-    crf: int,
-    hwaccel: str | None,
-    loop_cameras: bool,
-    render_duration: float | None,
+    camera_videos: Sequence[Path],
+    master_audio: Path,
+    duration: float,
 ) -> Path:
-    """Create a portable Resolve-importable OTIOZ project with editable cuts."""
-    if mode not in {pipeline.MODE_SPLIT_VIDEO, pipeline.MODE_SEPARATE_VIDEOS}:
-        raise ValueError(f"unsupported export mode: {mode}")
-    if len(camera_videos) not in {1, 2}:
-        raise ValueError("camera_videos must contain one combined video or two camera videos")
+    """Package already-rendered camera media into a portable OTIOZ project.
+
+    The camera angles and master audio come straight out of the unified render
+    pass, so this step never re-encodes anything: it only reads the frame rate
+    off the rendered media and writes the OTIO document, manifest, and archive.
+    """
+    if len(camera_videos) != 2:
+        raise ValueError("exactly two rendered camera videos are required")
 
     output_bundle.parent.mkdir(parents=True, exist_ok=True)
-    full_duration = pipeline.media_duration(audio_file)
-    duration = min(full_duration, render_duration) if render_duration else full_duration
     export_timeline = trim_timeline(timeline, duration=duration)
     if not export_timeline:
         raise ValueError("no camera events remain after trimming the timeline")
 
-    camera_source_sizes = [
-        pipeline.source_video_size(path) for path in camera_videos
-    ]
-    (width, height), camera_resolutions, camera_crops = (
-        resolve_camera_export_layout(mode, camera_source_sizes)
-    )
+    width, height = plan.canvas
+    camera_resolutions = [plan.canvas, plan.canvas]
     fps = video_fps(camera_videos[0])
     title = output_bundle.stem.replace("_", " ").strip().title()
 
-    with tempfile.TemporaryDirectory(prefix="davinci-export-", dir=output_bundle.parent) as tmpdir:
-        temp_dir = Path(tmpdir)
-        camera0_proxy = temp_dir / "camera_1.mp4"
-        camera1_proxy = temp_dir / "camera_2.mp4"
-        audio_proxy = temp_dir / "master_audio.m4a"
-
-        if mode == pipeline.MODE_SPLIT_VIDEO:
-            combined = camera_videos[0]
-            for target, crop in zip(
-                (camera0_proxy, camera1_proxy),
-                camera_crops,
-            ):
-                generate_video_proxy(
-                    source=combined,
-                    output=target,
-                    duration=duration,
-                    crop=crop,
-                    output_size=(width, height),
-                    encoder=encoder,
-                    preset=preset,
-                    crf=crf,
-                    hwaccel=hwaccel,
-                    loop=loop_cameras,
-                )
-            camera_names = ["Left Speaker", "Right Speaker"]
-        else:
-            if len(camera_videos) != 2:
-                raise ValueError("separate-videos mode requires two camera videos")
-            for source, target, crop in zip(
-                camera_videos,
-                (camera0_proxy, camera1_proxy),
-                camera_crops,
-            ):
-                generate_video_proxy(
-                    source=source,
-                    output=target,
-                    duration=duration,
-                    crop=crop,
-                    output_size=None,
-                    encoder=encoder,
-                    preset=preset,
-                    crf=crf,
-                    hwaccel=hwaccel,
-                    loop=loop_cameras,
-                )
-            camera_names = ["Camera 1", "Camera 2"]
-
-        generate_audio_proxy(
-            source=audio_file,
-            output=audio_proxy,
-            duration=duration,
-        )
-
-        media_files = [camera0_proxy, camera1_proxy, audio_proxy]
-        document = build_otio_document(
-            export_timeline,
-            mapping,
-            title=title,
-            fps=fps,
-            width=width,
-            height=height,
-            camera_media_names=[camera0_proxy.name, camera1_proxy.name],
-            camera_names=camera_names,
-            camera_resolutions=camera_resolutions,
-            audio_media_name=audio_proxy.name,
-        )
-        manifest = build_manifest(
-            export_timeline,
-            mapping,
-            mode=mode,
-            fps=fps,
-            width=width,
-            height=height,
-            camera_names=camera_names,
-            camera_resolutions=camera_resolutions,
-            original_inputs=[audio_file, *camera_videos],
-        )
-        write_otioz_bundle(
-            output_bundle,
-            document=document,
-            media_files=media_files,
-            manifest=manifest,
-            segments_json=segments_json,
-        )
-
+    document = build_otio_document(
+        export_timeline,
+        mapping,
+        title=title,
+        fps=fps,
+        width=width,
+        height=height,
+        camera_media_names=[path.name for path in camera_videos],
+        camera_names=plan.camera_names,
+        camera_resolutions=camera_resolutions,
+        audio_media_name=master_audio.name,
+    )
+    manifest = build_manifest(
+        export_timeline,
+        mapping,
+        mode=plan.mode,
+        fps=fps,
+        width=width,
+        height=height,
+        camera_names=plan.camera_names,
+        camera_resolutions=camera_resolutions,
+        original_inputs=[audio_file, *plan.video_inputs],
+    )
+    write_otioz_bundle(
+        output_bundle,
+        document=document,
+        media_files=[*camera_videos, master_audio],
+        manifest=manifest,
+        segments_json=segments_json,
+    )
     return output_bundle
