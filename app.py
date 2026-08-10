@@ -260,6 +260,7 @@ def _run_switcher(
         )
 
         davinci_bundle: Path | None = None
+        davinci_error: str | None = None
         if create_davinci_project:
             progress(0.86, desc="Creating portable DaVinci Resolve project")
             davinci_bundle = job_dir / "speaker_edit.otioz"
@@ -272,28 +273,38 @@ def _run_switcher(
                 export_mode = pipeline.MODE_SEPARATE_VIDEOS
                 export_cameras = [speaker0_path, speaker1_path]
 
-            davinci_export.create_davinci_otioz(
-                mode=export_mode,
-                audio_file=audio_path,
-                camera_videos=export_cameras,
-                segments_json=segments_json,
-                timeline=timeline,
-                mapping=mapping,
-                output_bundle=davinci_bundle,
-                encoder=encoder,
-                preset=preset,
-                crf=crf,
-                hwaccel=selected_hwaccel,
-                loop_cameras=loop_speaker_videos,
-                render_duration=None,
-            )
+            try:
+                davinci_export.create_davinci_otioz(
+                    mode=export_mode,
+                    audio_file=audio_path,
+                    camera_videos=export_cameras,
+                    segments_json=segments_json,
+                    timeline=timeline,
+                    mapping=mapping,
+                    output_bundle=davinci_bundle,
+                    encoder=encoder,
+                    preset=preset,
+                    crf=crf,
+                    hwaccel=selected_hwaccel,
+                    loop_cameras=loop_speaker_videos,
+                    render_duration=None,
+                )
+            except Exception as exc:
+                davinci_bundle.unlink(missing_ok=True)
+                davinci_error = f"{type(exc).__name__}: {exc}"
+                print(f"DaVinci export failed after the video render completed: {davinci_error}")
+                davinci_bundle = None
 
         elapsed = time.perf_counter() - started
-        davinci_details = (
-            f"DaVinci project: {davinci_bundle}\n"
-            if davinci_bundle
-            else "DaVinci project: not requested\n"
-        )
+        if davinci_bundle:
+            davinci_details = f"DaVinci project: {davinci_bundle}\n"
+        elif davinci_error:
+            davinci_details = (
+                "DaVinci project: export failed, but the rendered video and timeline are valid. "
+                f"{davinci_error}\n"
+            )
+        else:
+            davinci_details = "DaVinci project: not requested\n"
         status = (
             f"Done in {elapsed / 60:.1f} minutes.\n"
             f"Mode: {mode_details}\n"
@@ -478,7 +489,8 @@ def build_app() -> gr.Blocks:
                 info=(
                     "The bundle contains editable active-speaker cuts, two native-resolution "
                     "camera-angle exports, master audio, and the timeline manifest. "
-                    "Creating it requires two additional video encodes and can be large."
+                    "The proxy encodes use the selected CQ quality instead of lossless QP=0 "
+                    "to keep long 4K projects to a practical size."
                 ),
             )
 

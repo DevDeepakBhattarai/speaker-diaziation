@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import main
 
@@ -224,6 +225,41 @@ class TimelineJsonTests(unittest.TestCase):
 
 
 class SplitVideoEncodingTests(unittest.TestCase):
+    def test_split_render_honors_configured_cq_instead_of_forcing_lossless(self) -> None:
+        timeline = [main.Segment(0.0, 2.0, "SPEAKER_00")]
+        mapping = {"SPEAKER_00": 0}
+        combined = Path("combined.mp4")
+
+        with (
+            mock.patch("main.source_video_size", return_value=(3840, 2160)),
+            mock.patch(
+                "main.ffmpeg_filter_for_split_video_segments",
+                return_value=("null[outv]", "outv", 3840, 2160),
+            ),
+            mock.patch("main.media_duration", return_value=2.0),
+            mock.patch("main.run") as run,
+        ):
+            main.assemble_split_video(
+                audio_file=combined,
+                combined_video=combined,
+                output_video=Path("output.mp4"),
+                timeline=timeline,
+                mapping=mapping,
+                encoder="h264_nvenc",
+                audio_codec="aac",
+                preset="p1",
+                crf=26,
+                hwaccel="cuda",
+                loop_video=False,
+                render_duration=2.0,
+            )
+
+        command = run.call_args.args[0]
+        self.assertIn("-cq", command)
+        self.assertEqual(command[command.index("-cq") + 1], "26")
+        self.assertNotIn("-tune", command)
+        self.assertNotIn("constqp", command)
+
     def test_nvenc_lossless_encoding_uses_constant_qp_zero(self) -> None:
         command: list[str] = []
         main.append_video_encoding_options(

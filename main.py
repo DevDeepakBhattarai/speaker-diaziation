@@ -686,7 +686,6 @@ def assemble_split_video(
         encoder=encoder,
         preset=preset,
         crf=crf,
-        lossless=True,
     )
     command.extend(
         [

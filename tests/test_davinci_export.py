@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import davinci_export
 import main
@@ -194,6 +195,54 @@ class OtiozBundleTests(unittest.TestCase):
                         archive.getinfo(media_path).compress_type,
                         zipfile.ZIP_STORED,
                     )
+
+
+class DavinciProxyEncodingTests(unittest.TestCase):
+    def test_split_davinci_proxies_use_selected_quality_not_forced_lossless(self) -> None:
+        timeline = [
+            main.Segment(0.0, 1.0, "SPEAKER_00"),
+            main.Segment(1.0, 2.0, "SPEAKER_01"),
+        ]
+        mapping = {"SPEAKER_00": 0, "SPEAKER_01": 1}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            combined = root / "combined.mp4"
+            audio = root / "audio.wav"
+            segments = root / "speaker_segments.json"
+            output = root / "speaker_edit.otioz"
+            combined.write_bytes(b"video")
+            audio.write_bytes(b"audio")
+            segments.write_text("{}", encoding="utf-8")
+
+            with (
+                mock.patch("davinci_export.pipeline.media_duration", return_value=2.0),
+                mock.patch("davinci_export.pipeline.source_video_size", return_value=(3840, 2160)),
+                mock.patch("davinci_export.video_fps", return_value=30.0),
+                mock.patch("davinci_export.generate_video_proxy") as generate_video_proxy,
+                mock.patch("davinci_export.generate_audio_proxy"),
+                mock.patch("davinci_export.write_otioz_bundle"),
+            ):
+                davinci_export.create_davinci_otioz(
+                    mode=main.MODE_SPLIT_VIDEO,
+                    audio_file=audio,
+                    camera_videos=[combined],
+                    segments_json=segments,
+                    timeline=timeline,
+                    mapping=mapping,
+                    output_bundle=output,
+                    encoder="h264_nvenc",
+                    preset="p1",
+                    crf=26,
+                    hwaccel="cuda",
+                    loop_cameras=False,
+                    render_duration=None,
+                )
+
+            self.assertEqual(generate_video_proxy.call_count, 2)
+            for call in generate_video_proxy.call_args_list:
+                self.assertFalse(call.kwargs.get("lossless", False))
+                self.assertEqual(call.kwargs["crf"], 26)
 
 
 if __name__ == "__main__":

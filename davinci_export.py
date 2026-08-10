@@ -531,6 +531,9 @@ def write_otioz_bundle(
     if len(set(basenames)) != len(basenames):
         raise ValueError("OTIOZ media files must have unique basenames")
 
+    partial_output = output.with_name(f".{output.name}.partial")
+    partial_output.unlink(missing_ok=True)
+
     readme = (
         "DaVinci Resolve import\n"
         "======================\n\n"
@@ -542,39 +545,43 @@ def write_otioz_bundle(
         "for auditing or regenerating the edit.\n"
     )
 
-    with zipfile.ZipFile(output, "w", allowZip64=True) as archive:
-        archive.writestr(
-            "content.otio",
-            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
-            compress_type=zipfile.ZIP_DEFLATED,
-        )
-        archive.writestr(
-            "version.txt",
-            OTIOZ_VERSION,
-            compress_type=zipfile.ZIP_DEFLATED,
-        )
-        archive.writestr(
-            "davinci_manifest.json",
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            compress_type=zipfile.ZIP_DEFLATED,
-        )
-        archive.writestr(
-            "README.txt",
-            readme,
-            compress_type=zipfile.ZIP_DEFLATED,
-        )
-        archive.write(
-            segments_json,
-            arcname="speaker_segments.json",
-            compress_type=zipfile.ZIP_DEFLATED,
-        )
-        for media_file in media_files:
-            # OTIOZ media is conventionally stored without ZIP recompression.
-            archive.write(
-                media_file,
-                arcname=f"media/{media_file.name}",
-                compress_type=zipfile.ZIP_STORED,
+    try:
+        with zipfile.ZipFile(partial_output, "w", allowZip64=True) as archive:
+            archive.writestr(
+                "content.otio",
+                json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                compress_type=zipfile.ZIP_DEFLATED,
             )
+            archive.writestr(
+                "version.txt",
+                OTIOZ_VERSION,
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+            archive.writestr(
+                "davinci_manifest.json",
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+            archive.writestr(
+                "README.txt",
+                readme,
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+            archive.write(
+                segments_json,
+                arcname="speaker_segments.json",
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+            for media_file in media_files:
+                # OTIOZ media is conventionally stored without ZIP recompression.
+                archive.write(
+                    media_file,
+                    arcname=f"media/{media_file.name}",
+                    compress_type=zipfile.ZIP_STORED,
+                )
+        partial_output.replace(output)
+    finally:
+        partial_output.unlink(missing_ok=True)
 
 
 def create_davinci_otioz(
@@ -638,7 +645,6 @@ def create_davinci_otioz(
                     crf=crf,
                     hwaccel=hwaccel,
                     loop=loop_cameras,
-                    lossless=True,
                 )
             camera_names = ["Left Speaker", "Right Speaker"]
         else:

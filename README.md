@@ -137,8 +137,9 @@ native pixel density and never scales it. The cropped pixels are placed on an
 output canvas matching the source dimensions, so a 3840x2160 source remains
 3840x2160 instead of becoming a 1920-wide render. The unused canvas area is
 padded rather than stretching the crop. Split-video renders and Resolve camera
-exports use lossless video encoding to avoid adding generation loss. For two
-separate camera files, each source keeps its original resolution.
+exports keep the selected CQ/CRF quality setting instead of forcing lossless QP=0,
+which avoids extremely large long-form 4K intermediates. For two separate camera
+files, each source keeps its original resolution.
 
 Import the downloaded file in DaVinci Resolve using **File > Import > Timeline**
 and select `speaker_edit.otioz`. Keep the imported timeline frame rate when
