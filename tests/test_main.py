@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import main
+import job
 
 
 class SpeakerMappingTests(unittest.TestCase):
@@ -251,6 +254,64 @@ class SplitVideoEncodingTests(unittest.TestCase):
         )
 
         self.assertEqual(command, ["-preset", "medium", "-crf", "0"])
+
+    def test_videotoolbox_quality_changes_with_requested_crf(self) -> None:
+        high_quality: list[str] = []
+        low_quality: list[str] = []
+
+        main.append_video_encoding_options(
+            high_quality,
+            encoder="h264_videotoolbox",
+            preset="p1",
+            crf=18,
+        )
+        main.append_video_encoding_options(
+            low_quality,
+            encoder="h264_videotoolbox",
+            preset="p1",
+            crf=35,
+        )
+
+        self.assertEqual(high_quality[:1], ["-q:v"])
+        self.assertEqual(low_quality[:1], ["-q:v"])
+        self.assertNotEqual(high_quality, low_quality)
+        self.assertGreater(int(high_quality[1]), int(low_quality[1]))
+
+
+class HardwareSelectionTests(unittest.TestCase):
+    def test_auto_encoder_uses_apple_videotoolbox_when_available(self) -> None:
+        with mock.patch(
+            "main.available_ffmpeg_encoders",
+            return_value=" V..... h264_videotoolbox VideoToolbox H.264 Encoder",
+        ):
+            self.assertEqual(main.choose_video_encoder("auto"), "h264_videotoolbox")
+
+    def test_auto_hwaccel_matches_videotoolbox_encoder(self) -> None:
+        self.assertEqual(
+            main.choose_hwaccel("auto", "h264_videotoolbox"),
+            "videotoolbox",
+        )
+
+    def test_videotoolbox_session_limit_is_probed(self) -> None:
+        self.addCleanup(main._ENCODER_SESSION_LIMITS.clear)
+        with mock.patch("main._probe_encoder_sessions", return_value=True) as probe:
+            self.assertEqual(
+                main.max_parallel_encoder_sessions("h264_videotoolbox", 3),
+                3,
+            )
+        probe.assert_called_once_with("h264_videotoolbox", 3)
+
+    def test_job_defaults_are_portable(self) -> None:
+        request = job.JobRequest(
+            mode=main.MODE_SPLIT_VIDEO,
+            videos=(Path("combined.mp4"),),
+            audio_file=Path("combined.mp4"),
+            output_video=Path("out.mp4"),
+            segments_json=Path("segments.json"),
+        )
+        self.assertEqual(request.device, "auto")
+        self.assertEqual(request.video_encoder, "auto")
+        self.assertEqual(request.hwaccel, "auto")
 
 
 TIMELINE = [
@@ -534,6 +595,44 @@ class SinglePassRenderTests(unittest.TestCase):
 
 
 class DiarizationConfigurationTests(unittest.TestCase):
+    def test_model_loader_returning_none_is_reported_as_access_error(self) -> None:
+        class FakePipeline:
+            @staticmethod
+            def from_pretrained(*_args, **_kwargs):
+                return None
+
+        fake_dotenv = types.ModuleType("dotenv")
+        fake_dotenv.load_dotenv = lambda: None
+        fake_torch = types.ModuleType("torch")
+        fake_torch.cuda = types.SimpleNamespace(is_available=lambda: False)
+        fake_torch.device = lambda value: value
+        fake_pyannote = types.ModuleType("pyannote")
+        fake_pyannote_audio = types.ModuleType("pyannote.audio")
+        fake_pyannote_audio.Pipeline = FakePipeline
+
+        with (
+            mock.patch("main._ensure_torchcodec_ffmpeg_dlls"),
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "dotenv": fake_dotenv,
+                    "torch": fake_torch,
+                    "pyannote": fake_pyannote,
+                    "pyannote.audio": fake_pyannote_audio,
+                },
+            ),
+        ):
+            with self.assertRaisesRegex(main.DiarizationError, "HF_TOKEN is valid"):
+                main.diarize_audio(
+                    Path("conversation.wav"),
+                    model=main.DIARIZATION_MODEL,
+                    hf_token="hf_test",
+                    device="cpu",
+                    min_speakers=None,
+                    max_speakers=None,
+                    num_speakers=2,
+                )
+
     def test_default_model_is_current_local_community_pipeline(self) -> None:
         self.assertEqual(
             main.DIARIZATION_MODEL,

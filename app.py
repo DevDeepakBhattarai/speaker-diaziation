@@ -341,23 +341,30 @@ def build_app() -> gr.Blocks:
                 preset = gr.Dropdown(
                     ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
                     value="p1",
-                    label="NVENC preset",
+                    label="Encoder preset",
                 )
                 crf = gr.Slider(18, 35, value=26, step=1, label="CQ quality")
             with gr.Row():
                 device = gr.Dropdown(
-                    ["cuda", "auto", "cpu"],
-                    value="cuda",
+                    ["auto", "cuda", "cpu"],
+                    value="auto",
                     label="Diarization device",
                 )
                 hwaccel = gr.Dropdown(
-                    ["cuda", "auto", "none"],
-                    value="cuda",
+                    ["auto", "cuda", "videotoolbox", "none"],
+                    value="auto",
                     label="FFmpeg hardware acceleration",
                 )
                 video_encoder = gr.Dropdown(
-                    ["h264_nvenc", "hevc_nvenc", "auto", "libx264"],
-                    value="h264_nvenc",
+                    [
+                        "auto",
+                        "h264_nvenc",
+                        "hevc_nvenc",
+                        "h264_videotoolbox",
+                        "hevc_videotoolbox",
+                        "libx264",
+                    ],
+                    value="auto",
                     label="Video encoder",
                 )
             loop_speaker_videos = gr.Checkbox(

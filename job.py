@@ -32,7 +32,7 @@ class JobRequest:
     reuse_segments_from: Path | None = None
     model: str = pipeline.DIARIZATION_MODEL
     hf_token: str | None = None
-    device: str = "cuda"
+    device: str = "auto"
     num_speakers: int | None = 2
     min_speakers: int | None = None
     max_speakers: int | None = None
@@ -40,11 +40,11 @@ class JobRequest:
     silence_threshold: float = 2.5
     silence_lookahead: float = 5.0
     gap_padding: float = 0.05
-    video_encoder: str = "h264_nvenc"
+    video_encoder: str = "auto"
     audio_codec: str = "aac"
     preset: str = "p4"
     crf: int = 23
-    hwaccel: str = "cuda"
+    hwaccel: str = "auto"
     loop_videos: bool = False
     render_duration: float | None = None
 
