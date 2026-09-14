@@ -140,20 +140,57 @@ write_hf_token() {
 validate_hf_access() {
   uv run python - <<'PY'
 import os
+import sys
 from dotenv import load_dotenv
-from pyannote.audio import Pipeline
+from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
 
+MODEL_ID = "pyannote/speaker-diarization-community-1"
 load_dotenv(override=True)
-token = os.environ.get("HF_TOKEN")
+token = os.environ.get("HF_TOKEN", "").strip()
 if not token:
-    raise SystemExit("HF_TOKEN is missing from .env")
-pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=token)
-if pipeline is None:
-    raise SystemExit(
-        "Hugging Face could not load the Pyannote model with this token. "
-        "Check the token and accept the model terms."
+    print("Hugging Face token is missing.", file=sys.stderr)
+    raise SystemExit(10)
+
+api = HfApi()
+try:
+    account = api.whoami(token=token)
+except HfHubHTTPError as exc:
+    status = getattr(exc.response, "status_code", None)
+    if status == 401:
+        print("Hugging Face rejected this token. Create a new read token and try again.", file=sys.stderr)
+        raise SystemExit(11)
+    print(f"Could not validate the Hugging Face token: {exc}", file=sys.stderr)
+    raise SystemExit(12)
+
+username = account.get("name") or account.get("fullname") or "unknown account"
+print(f"Hugging Face token is valid for account: {username}")
+
+try:
+    hf_hub_download(
+        repo_id=MODEL_ID,
+        filename="config.yaml",
+        token=token,
+        force_download=True,
     )
-print("Pyannote model access is ready.")
+except GatedRepoError:
+    print(
+        f"The token is valid, but its Hugging Face account does not have access to {MODEL_ID}.\n"
+        f"Open https://huggingface.co/{MODEL_ID}, accept/request access while signed into the same account, "
+        "then try this token again.",
+        file=sys.stderr,
+    )
+    raise SystemExit(13)
+except HfHubHTTPError as exc:
+    status = getattr(exc.response, "status_code", None)
+    print(
+        f"The token is valid, but Hugging Face returned HTTP {status or 'error'} while downloading "
+        f"{MODEL_ID}/config.yaml: {exc}",
+        file=sys.stderr,
+    )
+    raise SystemExit(14)
+
+print("Authenticated Pyannote model download is ready.")
 PY
 }
 
@@ -179,7 +216,7 @@ else
       break
     fi
     echo
-    echo "That token could not access the model. Check the account/model terms and try again."
+    echo "The validation message above explains what Hugging Face rejected. Fix that issue and try again."
   done
 fi
 

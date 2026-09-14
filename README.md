@@ -119,7 +119,7 @@ For a fresh Mac, open **Terminal** and paste this one command:
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/DevDeepakBhattarai/speaker-diaziation/main/setup-mac.command)"
 ```
 
-This first-run command avoids macOS Gatekeeper quarantine on a browser-downloaded `.command` file. The setup script installs Homebrew when needed, then installs Git, `uv`, FFmpeg, Python 3.12, and the locked project dependencies. It clones or updates `main` in `~/SpeakerDiarization`, validates VideoToolbox, asks for the Hugging Face token, checks Pyannote model access, and creates executable Desktop launchers.
+This first-run command avoids macOS Gatekeeper quarantine on a browser-downloaded `.command` file. The setup script installs Homebrew when needed, then installs Git, `uv`, FFmpeg, Python 3.12, and the locked project dependencies. It clones or updates `main` in `~/SpeakerDiarization`, validates VideoToolbox, asks for a Hugging Face token, verifies the token account with the Hugging Face API, forces an authenticated download of the gated Pyannote `config.yaml`, and creates executable Desktop launchers.
 
 After setup, double-click `Start Speaker Diarization.command` on the Desktop whenever the app is needed. Use `Update Speaker Diarization.command` to update or repair the installation. Setup removes the quarantine attribute from both Desktop launchers.
 
