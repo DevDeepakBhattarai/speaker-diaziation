@@ -87,7 +87,8 @@ The canvas is chosen so nothing is ever scaled:
 - FFmpeg and FFprobe on `PATH`
 - Python 3.10, 3.11, or 3.12
 - A Hugging Face token with access to `pyannote/speaker-diarization-community-1`
-- A CUDA-enabled PyTorch build and an FFmpeg build with `h264_nvenc`
+- Windows/Linux NVIDIA: CUDA-enabled PyTorch and an FFmpeg build with `h264_nvenc`
+- Apple Silicon macOS: regular PyTorch wheels and FFmpeg with Apple VideoToolbox
 - On Windows, an FFmpeg 4-7 **shared** build for TorchCodec DLL loading
 
 Install/update Python dependencies with uv:
@@ -109,6 +110,17 @@ winget install --id BtbN.FFmpeg.GPL.Shared.7.1 -e
 
 The app automatically registers that WinGet DLL directory before importing
 Pyannote, so it can coexist with a newer FFmpeg CLI used for rendering.
+
+### Apple Silicon Mac setup
+
+Use the two Finder-launchable scripts in the repository:
+
+1. Double-click `setup-mac.command` once. It installs the dependencies, clones or updates the project in `~/SpeakerDiarization`, asks for the Hugging Face token, checks model access, and creates desktop launchers.
+2. After setup, double-click `Start Speaker Diarization.command` on the Desktop whenever the app is needed.
+
+If Homebrew is not installed yet, the setup script opens the official Homebrew page. Install Homebrew once, then double-click `setup-mac.command` again. The pinned `torchcodec==0.7.0` package publishes a macOS wheel for Apple Silicon, not Intel Macs, so this setup intentionally requires an M1 or newer Mac.
+
+On macOS, diarization runs on CPU. FFmpeg auto-selects `h264_videotoolbox` for GPU-backed video encoding and `videotoolbox` for hardware video decoding. MLX is not required because the model path is intentionally left unchanged.
 
 ## Gradio App
 
@@ -209,13 +221,12 @@ camera file is shorter than the soundtrack.
 
 ## GPU Acceleration
 
-By default, the script uses the NVIDIA CUDA path:
+The default hardware choices are now automatic:
 
-- pyannote diarization runs with `--device cuda`
-- segmentation and speaker-embedding inference use a memory-safe batch size of 1
-- FFmpeg decodes and encodes frames as a stream; the full video is never loaded
-  into VRAM
-- FFmpeg encoding uses `h264_nvenc`
+- NVIDIA systems select CUDA for Pyannote when available, `h264_nvenc` for FFmpeg encoding, and CUDA hardware decoding.
+- Apple Silicon Macs run Pyannote on CPU and select Apple VideoToolbox for FFmpeg encoding and decoding.
+- segmentation and speaker-embedding inference use a memory-safe batch size of 1.
+- FFmpeg decodes and encodes frames as a stream; the full video is never loaded into GPU memory.
 
 A 24 GB source file does not need 24 GB of VRAM. VRAM usage is controlled by
 the model and current inference/frame batches, not by the source file size.

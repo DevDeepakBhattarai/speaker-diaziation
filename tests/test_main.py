@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 import main
+import job
 
 
 class SpeakerMappingTests(unittest.TestCase):
@@ -251,6 +252,42 @@ class SplitVideoEncodingTests(unittest.TestCase):
         )
 
         self.assertEqual(command, ["-preset", "medium", "-crf", "0"])
+
+
+class HardwareSelectionTests(unittest.TestCase):
+    def test_auto_encoder_uses_apple_videotoolbox_when_available(self) -> None:
+        with mock.patch(
+            "main.available_ffmpeg_encoders",
+            return_value=" V..... h264_videotoolbox VideoToolbox H.264 Encoder",
+        ):
+            self.assertEqual(main.choose_video_encoder("auto"), "h264_videotoolbox")
+
+    def test_auto_hwaccel_matches_videotoolbox_encoder(self) -> None:
+        self.assertEqual(
+            main.choose_hwaccel("auto", "h264_videotoolbox"),
+            "videotoolbox",
+        )
+
+    def test_videotoolbox_session_limit_is_probed(self) -> None:
+        self.addCleanup(main._ENCODER_SESSION_LIMITS.clear)
+        with mock.patch("main._probe_encoder_sessions", return_value=True) as probe:
+            self.assertEqual(
+                main.max_parallel_encoder_sessions("h264_videotoolbox", 3),
+                3,
+            )
+        probe.assert_called_once_with("h264_videotoolbox", 3)
+
+    def test_job_defaults_are_portable(self) -> None:
+        request = job.JobRequest(
+            mode=main.MODE_SPLIT_VIDEO,
+            videos=(Path("combined.mp4"),),
+            audio_file=Path("combined.mp4"),
+            output_video=Path("out.mp4"),
+            segments_json=Path("segments.json"),
+        )
+        self.assertEqual(request.device, "auto")
+        self.assertEqual(request.video_encoder, "auto")
+        self.assertEqual(request.hwaccel, "auto")
 
 
 TIMELINE = [

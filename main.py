@@ -105,7 +105,7 @@ def choose_video_encoder(requested: str) -> str:
         return requested
 
     encoders = available_ffmpeg_encoders()
-    for encoder in ("h264_nvenc", "h264_amf", "h264_qsv"):
+    for encoder in ("h264_nvenc", "h264_amf", "h264_qsv", "h264_videotoolbox"):
         if encoder in encoders:
             return encoder
     return "libx264"
@@ -203,7 +203,7 @@ def diarize_audio(
         from pyannote.audio import Pipeline
     except ImportError as exc:
         raise DiarizationError(
-            "Missing Python dependencies. Run `uv sync` to install the Pyannote/CUDA stack."
+            "Missing Python dependencies. Run `uv sync` to install the project dependencies."
         ) from exc
 
     load_dotenv()
@@ -231,7 +231,7 @@ def diarize_audio(
     # Batch size changes only inference scheduling, not diarization semantics.
     # Keep it conservative for an 8 GiB GPU while processing the whole source.
     safe_batch_size = _configure_diarization_batch_size(pipeline, batch_size)
-    print(f"Using diarization GPU batch size: {safe_batch_size}")
+    print(f"Using diarization batch size: {safe_batch_size}")
 
     options: dict[str, int] = {}
     if num_speakers is not None:
@@ -662,6 +662,8 @@ def choose_hwaccel(requested: str, encoder: str) -> str | None:
         return "qsv"
     if encoder.endswith("_amf"):
         return "dxva2"
+    if encoder.endswith("_videotoolbox"):
+        return "videotoolbox"
     return None
 
 
@@ -739,7 +741,8 @@ def max_parallel_encoder_sessions(encoder: str, desired: int) -> int:
     if desired <= 1:
         return 1
     if not any(
-        encoder.endswith(suffix) for suffix in ("_nvenc", "_qsv", "_amf", "_vaapi")
+        encoder.endswith(suffix)
+        for suffix in ("_nvenc", "_qsv", "_amf", "_vaapi", "_videotoolbox")
     ):
         return desired
 
@@ -1003,7 +1006,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--output", type=Path, default=Path("speaker_switched.mp4"))
     parser.add_argument("--model", default=DIARIZATION_MODEL, help="Hugging Face diarization model.")
     parser.add_argument("--hf-token", help="Hugging Face token. Defaults to HF_TOKEN.")
-    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="cuda")
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--num-speakers", type=int, default=2, help="Exact speaker count for diarization.")
     parser.add_argument("--min-speakers", type=int, help="Minimum speaker count for diarization.")
     parser.add_argument("--max-speakers", type=int, help="Maximum speaker count for diarization.")
@@ -1031,14 +1034,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.05,
         help="Camera-only speech-end padding when measuring silence gaps.",
     )
-    parser.add_argument("--video-encoder", default="h264_nvenc")
+    parser.add_argument("--video-encoder", default="auto")
     parser.add_argument("--audio-codec", default="aac")
     parser.add_argument("--preset", default="p4", help="Encoder preset. For NVENC, p1 is fastest.")
     parser.add_argument("--crf", type=int, default=23, help="CRF/CQ quality value.")
     parser.add_argument(
         "--hwaccel",
-        default="cuda",
-        help="FFmpeg hardware decoder: cuda, auto, qsv, dxva2, d3d11va, or none.",
+        default="auto",
+        help=(
+            "FFmpeg hardware decoder: auto, cuda, videotoolbox, qsv, dxva2, "
+            "d3d11va, or none."
+        ),
     )
     parser.add_argument(
         "--loop-speaker-videos",
