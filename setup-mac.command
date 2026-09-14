@@ -146,7 +146,7 @@ from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
 
 MODEL_ID = "pyannote/speaker-diarization-community-1"
-load_dotenv(override=True)
+load_dotenv(dotenv_path=".env", override=True)
 token = os.environ.get("HF_TOKEN", "").strip()
 if not token:
     print("Hugging Face token is missing.", file=sys.stderr)
