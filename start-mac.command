@@ -60,7 +60,7 @@ fi
 
 page=""
 if page="$(curl -fsS "$URL" 2>/dev/null)"; then
-  if printf '%s' "$page" | grep -Fq "$APP_MARKER"; then
+  if [[ "$page" == *"$APP_MARKER"* ]]; then
     open "$URL"
     trap - EXIT INT TERM
     exit 0
@@ -81,7 +81,7 @@ for _ in {1..90}; do
     wait "$APP_PID"
     exit $?
   fi
-  if curl -fsS "$URL" 2>/dev/null | grep -Fq "$APP_MARKER"; then
+  if page="$(curl -fsS "$URL" 2>/dev/null)" && [[ "$page" == *"$APP_MARKER"* ]]; then
     open "$URL"
     opened=1
     break
