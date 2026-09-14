@@ -23,6 +23,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Setup clears quarantine on the Desktop copy. Keep this as a repair path for
+# launchers copied by AirDrop, Messages, or another quarantine-preserving app.
+if command -v xattr >/dev/null 2>&1; then
+  xattr -d com.apple.quarantine "$0" 2>/dev/null || true
+fi
+
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "This launcher is for macOS only."
   exit 1

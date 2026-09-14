@@ -113,16 +113,19 @@ Pyannote, so it can coexist with a newer FFmpeg CLI used for rendering.
 
 ### Apple Silicon Mac setup
 
-Use the two Finder-launchable scripts in the repository:
+For a fresh Mac, open **Terminal** and paste this one command:
 
-1. Double-click `setup-mac.command` once. It installs the dependencies, clones or updates the project in `~/SpeakerDiarization`, asks for the Hugging Face token, checks model access, and creates desktop launchers.
-2. After setup, double-click `Start Speaker Diarization.command` on the Desktop whenever the app is needed.
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/DevDeepakBhattarai/speaker-diaziation/main/setup-mac.command)"
+```
 
-If Homebrew is not installed yet, the setup script opens the official Homebrew page. Install Homebrew once, then double-click `setup-mac.command` again. The pinned `torchcodec==0.7.0` package publishes a macOS wheel for Apple Silicon, not Intel Macs, so this setup intentionally requires an M1 or newer Mac.
+This first-run command avoids macOS Gatekeeper quarantine on a browser-downloaded `.command` file. The setup script installs Homebrew when needed, then installs Git, `uv`, FFmpeg, Python 3.12, and the locked project dependencies. It clones or updates `main` in `~/SpeakerDiarization`, validates VideoToolbox, asks for the Hugging Face token, checks Pyannote model access, and creates executable Desktop launchers.
 
-On macOS, diarization runs on CPU. FFmpeg auto-selects `h264_videotoolbox` for GPU-backed video encoding and `videotoolbox` for hardware video decoding. The app maps its CRF/CQ quality control to VideoToolbox's quality scale, so the quality setting still affects Mac renders. MLX is not required because the model path is intentionally left unchanged.
+After setup, double-click `Start Speaker Diarization.command` on the Desktop whenever the app is needed. Use `Update Speaker Diarization.command` to update or repair the installation. Setup removes the quarantine attribute from both Desktop launchers.
 
-The updater follows `main` once the Mac launchers are available there. Until then, it can bootstrap from the Mac feature branch and automatically migrates to `main` on a later setup run. Set `SPEAKER_DIARIZATION_REF` only when testing a specific branch.
+A `.command` file downloaded through Safari, Messages, AirDrop, or another quarantine-aware app can still be blocked before its code runs. macOS only treats a downloaded executable as fully verified when it has an Apple Developer ID signature and notarization. The Terminal bootstrap above avoids that first-run Gatekeeper path without requiring Git, Python, Homebrew, or executable permissions beforehand.
+
+The pinned `torchcodec==0.7.0` package publishes a macOS wheel for Apple Silicon, not Intel Macs, so this setup intentionally requires an M1 or newer Mac. Diarization runs on CPU. FFmpeg auto-selects `h264_videotoolbox` for GPU-backed video encoding and `videotoolbox` for hardware video decoding. The app maps its CRF/CQ quality control to VideoToolbox's quality scale. MLX is not required.
 
 ## Gradio App
 
