@@ -1,7 +1,8 @@
 #!/bin/bash
 set -Eeuo pipefail
 REPO_URL="https://github.com/DevDeepakBhattarai/speaker-diaziation.git"
-REPO_REF="${SPEAKER_DIARIZATION_REF:-feat/mac-launchers}"
+STABLE_REF="${SPEAKER_DIARIZATION_REF:-main}"
+BOOTSTRAP_REF="feat/mac-launchers"
 INSTALL_DIR="${SPEAKER_DIARIZATION_HOME:-$HOME/SpeakerDiarization}"
 
 finish_setup() {
@@ -68,64 +69,112 @@ if [[ -d "$INSTALL_DIR/.git" ]]; then
     echo "The existing install has local source-code changes, so setup will not overwrite it."
     exit 1
   fi
-  git -C "$INSTALL_DIR" fetch origin "$REPO_REF"
-  if git -C "$INSTALL_DIR" show-ref --verify --quiet "refs/heads/$REPO_REF"; then
-    git -C "$INSTALL_DIR" switch "$REPO_REF"
-  else
-    git -C "$INSTALL_DIR" switch -c "$REPO_REF" --track "origin/$REPO_REF"
-  fi
-  git -C "$INSTALL_DIR" pull --ff-only origin "$REPO_REF"
 elif [[ -e "$INSTALL_DIR" ]]; then
   echo "Install path exists and is not a Git checkout: $INSTALL_DIR"
   exit 1
 else
-  git clone --branch "$REPO_REF" --single-branch "$REPO_URL" "$INSTALL_DIR"
+  git clone "$REPO_URL" "$INSTALL_DIR"
 fi
+
+fetch_ref() {
+  git -C "$INSTALL_DIR" fetch origin "refs/heads/$1:refs/remotes/origin/$1"
+}
+
+ref_has_mac_launchers() {
+  git -C "$INSTALL_DIR" cat-file -e "refs/remotes/origin/$1:setup-mac.command" 2>/dev/null &&
+    git -C "$INSTALL_DIR" cat-file -e "refs/remotes/origin/$1:start-mac.command" 2>/dev/null
+}
+
+TARGET_REF="$STABLE_REF"
+if ! fetch_ref "$TARGET_REF"; then
+  if [[ -n "${SPEAKER_DIARIZATION_REF:-}" ]]; then
+    echo "Could not fetch the requested branch: $TARGET_REF"
+    exit 1
+  fi
+  TARGET_REF="$BOOTSTRAP_REF"
+  fetch_ref "$TARGET_REF"
+elif [[ -z "${SPEAKER_DIARIZATION_REF:-}" ]] && ! ref_has_mac_launchers "$TARGET_REF"; then
+  # Before the Mac launcher change lands on main, bootstrap from the review branch.
+  # Once main contains these files, the next setup run automatically migrates to main.
+  TARGET_REF="$BOOTSTRAP_REF"
+  fetch_ref "$TARGET_REF"
+fi
+
+if git -C "$INSTALL_DIR" show-ref --verify --quiet "refs/heads/$TARGET_REF"; then
+  git -C "$INSTALL_DIR" switch "$TARGET_REF"
+  git -C "$INSTALL_DIR" merge --ff-only "origin/$TARGET_REF"
+else
+  git -C "$INSTALL_DIR" switch -c "$TARGET_REF" "refs/remotes/origin/$TARGET_REF"
+fi
+
 cd "$INSTALL_DIR"
 uv sync --locked
 
-
 echo
-if [[ -f .env ]] && grep -qE '^HF_TOKEN=hf_' .env; then
-  echo "Existing Hugging Face token found."
-else
-  echo "Hugging Face access is required once for the diarization model."
-  open "https://huggingface.co/pyannote/speaker-diarization-community-1"
-  open "https://huggingface.co/settings/tokens"
-  echo "Accept the model terms, create a read token, then return here."
-  read -r -p "Press Return when those steps are done..." _
-  read -r -s -p "Paste the Hugging Face token: " HF_TOKEN
-  echo
-  if [[ "$HF_TOKEN" != hf_* ]]; then
-    echo "That token does not look valid. Hugging Face tokens start with hf_."
-    exit 1
-  fi
-  tmp_env="$(mktemp)"
-  if [[ -f .env ]]; then
-    grep -vE '^HF_TOKEN=' .env > "$tmp_env" || true
-  fi
-  printf 'HF_TOKEN=%s
-' "$HF_TOKEN" >> "$tmp_env"
-  mv "$tmp_env" .env
-fi
-
-echo
-echo "Checking Python and model access..."
+echo "Checking the local Python/audio stack..."
 uv run python - <<'PY'
-import os
-from dotenv import load_dotenv
 from pyannote.audio import Pipeline
 import torch
 import torchcodec
 
-load_dotenv()
+print(f"PyTorch {torch.__version__} is ready. Diarization will use CPU on this Mac.")
+PY
+
+write_hf_token() {
+  token="$1"
+  tmp_env="$(mktemp)"
+  if [[ -f .env ]]; then
+    grep -vE '^HF_TOKEN=' .env > "$tmp_env" || true
+  fi
+  printf 'HF_TOKEN=%s\n' "$token" >> "$tmp_env"
+  mv "$tmp_env" .env
+}
+
+validate_hf_access() {
+  uv run python - <<'PY'
+import os
+from dotenv import load_dotenv
+from pyannote.audio import Pipeline
+
+load_dotenv(override=True)
 token = os.environ.get("HF_TOKEN")
 if not token:
     raise SystemExit("HF_TOKEN is missing from .env")
-print(f"PyTorch {torch.__version__} is ready. Diarization will use CPU on this Mac.")
-Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=token)
+pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=token)
+if pipeline is None:
+    raise SystemExit(
+        "Hugging Face could not load the Pyannote model with this token. "
+        "Check the token and accept the model terms."
+    )
 print("Pyannote model access is ready.")
 PY
+}
+
+echo
+echo "Checking Hugging Face model access..."
+if [[ -f .env ]] && grep -qE '^HF_TOKEN=hf_' .env && validate_hf_access; then
+  echo "Existing Hugging Face access is valid."
+else
+  echo
+  echo "A valid Hugging Face token with Pyannote model access is required."
+  open "https://huggingface.co/pyannote/speaker-diarization-community-1"
+  open "https://huggingface.co/settings/tokens"
+  echo "Accept the model terms and create a read token, then return here."
+  while true; do
+    read -r -s -p "Paste the Hugging Face token: " HF_TOKEN
+    echo
+    if [[ "$HF_TOKEN" != hf_* ]]; then
+      echo "That token does not look valid. Hugging Face tokens start with hf_."
+      continue
+    fi
+    write_hf_token "$HF_TOKEN"
+    if validate_hf_access; then
+      break
+    fi
+    echo
+    echo "That token could not access the model. Check the account/model terms and try again."
+  done
+fi
 
 echo
 echo "Creating desktop launchers..."

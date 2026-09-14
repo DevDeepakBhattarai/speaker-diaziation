@@ -226,6 +226,11 @@ def diarize_audio(
             f"accept the Hugging Face model conditions for https://hf.co/{model} "
             "using the same account that created your HF_TOKEN."
         ) from exc
+    if pipeline is None:
+        raise DiarizationError(
+            "Could not load the Pyannote diarization model. Check that HF_TOKEN is valid "
+            f"and that its account has accepted the model conditions for https://hf.co/{model}."
+        )
     pipeline.to(torch.device(selected_device))
 
     # Batch size changes only inference scheduling, not diarization semantics.
@@ -682,6 +687,13 @@ def append_video_encoding_options(
             )
         else:
             command.extend(["-preset", preset, "-cq", str(crf)])
+    elif encoder.endswith("_videotoolbox"):
+        # On Apple Silicon, FFmpeg maps -q:v 0..100 onto VideoToolbox's
+        # kVTCompressionPropertyKey_Quality. Preserve CRF/CQ semantics here:
+        # a lower requested CRF becomes a higher VideoToolbox quality value.
+        bounded_crf = min(51, max(0, crf))
+        quality = 100 if lossless else max(1, round(100 - bounded_crf * 100 / 51))
+        command.extend(["-q:v", str(quality)])
     elif encoder == "libx264":
         x264_preset = (
             preset

@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 INSTALL_DIR="${SPEAKER_DIARIZATION_HOME:-$HOME/SpeakerDiarization}"
 URL="http://127.0.0.1:7860"
+APP_MARKER="Speaker Diarization Video Switcher"
 APP_PID=""
 
 cleanup() {
@@ -57,10 +58,16 @@ if [[ ! -x .venv/bin/python ]]; then
   uv sync --locked
 fi
 
-if curl -fsS "$URL" >/dev/null 2>&1; then
-  open "$URL"
-  trap - EXIT INT TERM
-  exit 0
+page=""
+if page="$(curl -fsS "$URL" 2>/dev/null)"; then
+  if printf '%s' "$page" | grep -Fq "$APP_MARKER"; then
+    open "$URL"
+    trap - EXIT INT TERM
+    exit 0
+  fi
+  echo "Port 7860 is already being used by another local app."
+  echo "Close that app, then start Speaker Diarization again."
+  exit 1
 fi
 
 echo "Starting Speaker Diarization..."
@@ -74,7 +81,7 @@ for _ in {1..90}; do
     wait "$APP_PID"
     exit $?
   fi
-  if curl -fsS "$URL" >/dev/null 2>&1; then
+  if curl -fsS "$URL" 2>/dev/null | grep -Fq "$APP_MARKER"; then
     open "$URL"
     opened=1
     break

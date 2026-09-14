@@ -120,7 +120,9 @@ Use the two Finder-launchable scripts in the repository:
 
 If Homebrew is not installed yet, the setup script opens the official Homebrew page. Install Homebrew once, then double-click `setup-mac.command` again. The pinned `torchcodec==0.7.0` package publishes a macOS wheel for Apple Silicon, not Intel Macs, so this setup intentionally requires an M1 or newer Mac.
 
-On macOS, diarization runs on CPU. FFmpeg auto-selects `h264_videotoolbox` for GPU-backed video encoding and `videotoolbox` for hardware video decoding. MLX is not required because the model path is intentionally left unchanged.
+On macOS, diarization runs on CPU. FFmpeg auto-selects `h264_videotoolbox` for GPU-backed video encoding and `videotoolbox` for hardware video decoding. The app maps its CRF/CQ quality control to VideoToolbox's quality scale, so the quality setting still affects Mac renders. MLX is not required because the model path is intentionally left unchanged.
+
+The updater follows `main` once the Mac launchers are available there. Until then, it can bootstrap from the Mac feature branch and automatically migrates to `main` on a later setup run. Set `SPEAKER_DIARIZATION_REF` only when testing a specific branch.
 
 ## Gradio App
 
