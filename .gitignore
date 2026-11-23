@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local secrets
+.env
+
+# Generated media and diarization output
+input/
+outputs/
+speaker_switched.mp4
+speaker_segments.json
+*.wav
+*.rttm
+
+# Local app/server logs
+*.log

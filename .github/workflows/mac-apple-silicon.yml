@@ -1,0 +1,42 @@
+name: Apple Silicon video quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Validate executable launchers
+        run: |
+          test "$(uname -m)" = arm64
+          bash -n setup-mac.command start-mac.command
+      - name: Install FFmpeg 7 with VideoToolbox
+        run: |
+          brew install ffmpeg@7
+          prefix="$(brew --prefix ffmpeg@7)"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          echo "DYLD_LIBRARY_PATH=$prefix/lib" >> "$GITHUB_ENV"
+      - name: Resolve locked Apple Silicon Python dependencies
+        run: |
+          uv python install 3.12
+          uv sync --locked --python 3.12
+      - name: Validate native FFmpeg and TorchCodec
+        run: |
+          ffmpeg -hide_banner -encoders | grep h264_videotoolbox
+          ffmpeg -hide_banner -encoders | grep hevc_videotoolbox
+          ffmpeg -hide_banner -hwaccels | grep videotoolbox
+          uv run --no-sync python -c 'import torch, torchcodec; from pyannote.audio import Pipeline; print("Apple Silicon ML imports passed")'
+      - name: Run unit and real VideoToolbox encode tests
+        run: uv run --no-sync python -m unittest discover -s tests -v
